@@ -1,0 +1,691 @@
+import asyncio
+import json
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import Response, StreamingResponse
+from sqlmodel import select
+
+from .algorithm import create_model_mappings
+from .auth import pay_for_request, revert_pay_for_request, validate_bearer_key
+from .core import get_logger
+from .core.db import (
+    ApiKey,
+    AsyncSession,
+    ModelRow,
+    UpstreamProviderRow,
+    create_session,
+    get_session,
+)
+from .core.exceptions import UpstreamError
+from .core.not_found import build_not_found_response
+from .core.settings import settings
+from .payment.helpers import (
+    calculate_discounted_max_cost,
+    check_token_balance,
+    create_error_response,
+    get_max_cost_for_model,
+)
+from .payment.models import Model
+from .upstream import BaseUpstreamProvider
+from .upstream.helpers import init_upstreams
+from .upstream.request_correction import correct_request, extract_error_message
+
+logger = get_logger(__name__)
+proxy_router = APIRouter()
+
+_upstreams: list[BaseUpstreamProvider] = []
+_model_instances: dict[str, Model] = {}  # All aliases -> Model
+_provider_map: dict[
+    str, list[BaseUpstreamProvider]
+] = {}  # All aliases -> List[Provider]
+_unique_models: dict[str, Model] = {}  # Unique model.id -> Model (no duplicates)
+
+
+async def initialize_upstreams() -> None:
+    """Initialize upstream providers from database during application startup."""
+    global _upstreams
+    _upstreams = await init_upstreams()
+    logger.info(f"Initialized {len(_upstreams)} upstream providers")
+    await refresh_model_maps()
+
+
+async def reinitialize_upstreams() -> None:
+    """Re-initialize upstream providers from database (called after admin changes)."""
+    global _upstreams
+    _upstreams = await init_upstreams()
+    logger.info(
+        "Re-initialized upstream providers from admin action",
+        extra={"provider_count": len(_upstreams)},
+    )
+    await refresh_model_maps()
+
+
+def get_upstreams() -> list[BaseUpstreamProvider]:
+    """Get the initialized upstream providers.
+
+    Returns:
+        List of upstream provider instances
+    """
+    return _upstreams
+
+
+def get_model_instance(model_id: str) -> Model | None:
+    """Get Model instance by ID from global cache."""
+    if not model_id:
+        return None
+
+    model_id_lower = model_id.lower()
+    # Try exact match first
+    if model := _model_instances.get(model_id_lower):
+        return model
+
+    # Try stripping common version suffixes (e.g., -20251222)
+    # This handles cases where upstream returns a specific version
+    # but we only track the base model name.
+    import re
+
+    base_model_id = re.sub(r"-\d{8}$", "", model_id_lower)
+    if base_model_id != model_id_lower:
+        if model := _model_instances.get(base_model_id):
+            return model
+
+    return None
+
+
+def get_provider_for_model(model_id: str) -> list[BaseUpstreamProvider] | None:
+    """Get UpstreamProvider list for model ID from global cache."""
+    return _provider_map.get(model_id.lower())
+
+
+def get_unique_models() -> list[Model]:
+    """Get list of unique models (no duplicates from aliases)."""
+    return list(_unique_models.values())
+
+
+async def refresh_model_maps() -> None:
+    """Refresh global model and provider maps using the cost-based algorithm."""
+    from sqlalchemy.orm import selectinload
+
+    global _model_instances, _provider_map, _unique_models
+
+    async with create_session() as session:
+        # Fetch all providers with their models in a single logical operation
+        query = select(UpstreamProviderRow).options(
+            selectinload(UpstreamProviderRow.models)  # type: ignore
+        )
+        result = await session.exec(query)
+        provider_rows = result.all()
+
+    overrides_by_id: dict[str, tuple[ModelRow, float]] = {}
+    disabled_model_ids: set[str] = set()
+
+    for provider in provider_rows:
+        if not provider.enabled:
+            continue
+        for model in provider.models:
+            if model.enabled:
+                overrides_by_id[model.id] = (model, provider.provider_fee)
+            else:
+                disabled_model_ids.add(model.id)
+
+    _model_instances, _provider_map, _unique_models = create_model_mappings(
+        upstreams=_upstreams,
+        overrides_by_id=overrides_by_id,
+        disabled_model_ids=disabled_model_ids,
+    )
+
+
+async def refresh_model_maps_periodically() -> None:
+    """Background task to refresh model maps every minute."""
+    import asyncio
+
+    while True:
+        try:
+            await asyncio.sleep(60)
+            await refresh_model_maps()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(
+                "Error refreshing model maps",
+                extra={"error": str(e), "error_type": type(e).__name__},
+            )
+
+
+_API_PATH_PREFIXES = (
+    "v1/",
+    "responses",
+    "chat/",
+    "completions",
+    "models",
+    "embeddings",
+    "audio/",
+    "images/",
+    "moderations",
+    "providers",
+    "tee/",
+)
+
+
+@proxy_router.api_route("/{path:path}", methods=["GET", "POST"], response_model=None)
+async def proxy(
+    request: Request, path: str, session: AsyncSession = Depends(get_session)
+) -> Response | StreamingResponse:
+    # GET requests must hit a known API prefix; otherwise return a 404 (HTML
+    # for browsers, JSON for API clients). POST requests are always forwarded
+    # so that OpenAI-style endpoints work with or without the `v1/` prefix
+    # (e.g. `/chat/completions` as well as `/v1/chat/completions`).
+    if request.method == "GET" and not path.startswith(_API_PATH_PREFIXES):
+        return build_not_found_response(request, path)
+
+    headers = dict(request.headers)
+
+    is_responses_api = path.startswith("v1/responses") or path.startswith("responses")
+    request_body = await request.body()
+    request_body_dict = parse_request_body_json(request_body, path)
+
+    # /tee/* GET requests (e.g. attestation) don't map to models — just
+    # forward to all enabled upstreams without model/cost/auth lookups.
+    if request.method == "GET" and path.startswith("tee/"):
+        all_upstreams = _upstreams
+        last_error_response = None
+        for i, upstream in enumerate(all_upstreams):
+            try:
+                headers = upstream.prepare_headers(dict(request.headers))
+                response = await upstream.forward_get_request(request, path, headers)
+                if response.status_code in [502, 429] and i < len(all_upstreams) - 1:
+                    logger.warning(
+                        "Upstream %s returned %s for tee GET %s, trying next",
+                        upstream.provider_type,
+                        response.status_code,
+                        path,
+                    )
+                    continue
+                return response
+            except UpstreamError as e:
+                logger.warning(
+                    "Upstream %s failed for tee GET %s: %s",
+                    upstream.provider_type,
+                    path,
+                    e,
+                )
+                if i == len(all_upstreams) - 1:
+                    last_error_response = create_error_response(
+                        "upstream_error", str(e), 502, request=request
+                    )
+                continue
+        return last_error_response or create_error_response(
+            "upstream_error", "All upstreams failed", 502, request=request
+        )
+
+    if is_responses_api:
+        model_id = extract_model_from_responses_request(request_body_dict)
+    else:
+        model_id = request_body_dict.get("model", "unknown")
+
+    model_obj = get_model_instance(model_id)
+
+    if not model_obj:
+        return create_error_response(
+            "invalid_model", f"Model '{model_id}' not found", 400, request=request
+        )
+
+    upstreams = get_provider_for_model(model_id)
+    if not upstreams:
+        return create_error_response(
+            "invalid_model",
+            f"No provider found for model '{model_id}'",
+            400,
+            request=request,
+        )
+
+    # todo figure out cost calculation since fallback provider is usually not the same price
+    # Use first provider for initial checks/cost calculation
+    # primary_upstream = upstreams[0]
+
+    _max_cost_for_model = await get_max_cost_for_model(
+        model=model_id, session=session, model_obj=model_obj
+    )
+    max_cost_for_model = await calculate_discounted_max_cost(
+        _max_cost_for_model, request_body_dict, model_obj=model_obj
+    )
+    # Ensure max_cost_for_model is at least the minimum allowed request cost
+    max_cost_for_model = max(max_cost_for_model, settings.min_request_msat)
+
+    check_token_balance(headers, request_body_dict, max_cost_for_model)
+
+    if x_cashu := headers.get("x-cashu", None):
+        last_error = None
+        for i, upstream in enumerate(upstreams):
+            try:
+                if is_responses_api:
+                    return await upstream.handle_x_cashu_responses(
+                        request, x_cashu, path, max_cost_for_model, model_obj
+                    )
+                else:
+                    return await upstream.handle_x_cashu(
+                        request, x_cashu, path, max_cost_for_model, model_obj
+                    )
+            except UpstreamError as e:
+                logger.warning(
+                    "Upstream %s failed (x-cashu) for model=%s: %s",
+                    upstream.provider_type,
+                    model_id,
+                    e,
+                    extra={
+                        "provider": upstream.provider_type,
+                        "model": model_id,
+                        "status_code": e.status_code,
+                    },
+                )
+                if i == len(upstreams) - 1:
+                    last_error = e
+                continue
+
+        return create_error_response(
+            "upstream_error",
+            str(last_error) if last_error else "All upstreams failed",
+            502,
+            request=request,
+        )
+
+    elif auth := headers.get("authorization", None):
+        key = await get_bearer_token_key(
+            headers, path, session, auth, max_cost_for_model, model_id
+        )
+
+    else:
+        if request.method not in ["GET"]:
+            raise HTTPException(
+                status_code=401,
+                detail={
+                    "error": {"type": "invalid_request_error", "code": "unauthorized"}
+                },
+            )
+
+        logger.debug("Processing unauthenticated GET request", extra={"path": path})
+
+        last_error_response = None
+        for i, upstream in enumerate(upstreams):
+            try:
+                headers = upstream.prepare_headers(dict(request.headers))
+                response = await upstream.forward_get_request(request, path, headers)
+
+                if response.status_code in [502, 429] and i < len(upstreams) - 1:
+                    error_message = ""
+                    try:
+                        if hasattr(response, "body"):
+                            body_bytes = response.body
+                            data = json.loads(body_bytes)
+                            if "error" in data:
+                                error_data = data["error"]
+                                if isinstance(error_data, dict):
+                                    error_message = error_data.get("message", "")
+                                elif isinstance(error_data, str):
+                                    error_message = error_data
+                    except Exception:
+                        pass
+
+                    await upstream.on_upstream_error_redirect(
+                        response.status_code, error_message
+                    )
+
+                    logger.warning(
+                        f"Upstream {upstream.provider_type} returned {response.status_code} (GET), trying next provider",
+                        extra={
+                            "status_code": response.status_code,
+                            "upstream": upstream.provider_type,
+                        },
+                    )
+                    continue
+                return response
+            except UpstreamError as e:
+                logger.warning(f"Upstream {upstream.provider_type} failed (GET): {e}")
+                if i == len(upstreams) - 1:
+                    last_error_response = create_error_response(
+                        "upstream_error", str(e), 502, request=request
+                    )
+                continue
+        return last_error_response or create_error_response(
+            "upstream_error", "All upstreams failed", 502, request=request
+        )
+
+    if request_body_dict:
+        await pay_for_request(key, max_cost_for_model, session)
+
+    # Tracks request params already removed in response to upstream rejections,
+    # shared across providers so a stripped param stays stripped on failover and
+    # the reactive retry can never loop unboundedly.
+    already_stripped: set[str] = set()
+
+    for i, upstream in enumerate(upstreams):
+        headers = upstream.prepare_headers(dict(request.headers))
+
+        try:
+            while True:
+                try:
+                    if is_responses_api:
+                        response = await upstream.forward_responses_request(
+                            request,
+                            path,
+                            headers,
+                            request_body,
+                            key,
+                            max_cost_for_model,
+                            session,
+                            model_obj,
+                        )
+                    else:
+                        response = await upstream.forward_request(
+                            request,
+                            path,
+                            headers,
+                            request_body,
+                            key,
+                            max_cost_for_model,
+                            session,
+                            model_obj,
+                        )
+                except UpstreamError:
+                    # Let the outer UpstreamError handler manage retry/revert
+                    raise
+                except Exception as e:
+                    # Unexpected error (not an upstream failure) — revert and propagate
+                    logger.error(
+                        "Unexpected error in upstream request, reverting payment",
+                        extra={
+                            "error": str(e),
+                            "error_type": type(e).__name__,
+                            "path": path,
+                            "key_hash": key.hashed_key[:8] + "...",
+                            "max_cost_for_model": max_cost_for_model,
+                        },
+                    )
+                    await revert_pay_for_request(key, session, max_cost_for_model)
+                    raise
+
+                # Reactive recovery: some models reject one specific request
+                # param (e.g. newer Anthropic models deprecating `temperature`).
+                # When the upstream 400s naming such a param, strip it from the
+                # body and retry the SAME upstream. ``already_stripped`` bounds
+                # this to one retry per distinct param so it always terminates.
+                if response.status_code == 400:
+                    correction = correct_request(
+                        request_body,
+                        extract_error_message(response),
+                        already_stripped,
+                    )
+                    if correction is not None:
+                        request_body, bad_param = correction.body, correction.label
+                        already_stripped.add(bad_param)
+                        logger.warning(
+                            "Upstream %s rejected param '%s' for model=%s; "
+                            "stripping and retrying same upstream",
+                            upstream.provider_type,
+                            bad_param,
+                            model_id,
+                            extra={
+                                "provider": upstream.provider_type,
+                                "model": model_id,
+                                "stripped_param": bad_param,
+                                "path": path,
+                            },
+                        )
+                        continue
+                break
+
+            if response.status_code != 200:
+                # Check if we should retry (502 Upstream Error or 429 Rate Limit)
+                should_retry = response.status_code in [502, 429, 400, 401, 403, 404]
+                if should_retry and i < len(upstreams) - 1:
+                    error_message = ""
+                    try:
+                        if hasattr(response, "body"):
+                            body_bytes = response.body
+                            data = json.loads(body_bytes)
+                            if "error" in data:
+                                error_data = data["error"]
+                                if isinstance(error_data, dict):
+                                    error_message = error_data.get("message", "")
+                                elif isinstance(error_data, str):
+                                    error_message = error_data
+                    except Exception:
+                        pass
+
+                    await upstream.on_upstream_error_redirect(
+                        response.status_code, error_message
+                    )
+
+                    logger.warning(
+                        "Upstream %s returned %s for model=%s, trying next provider",
+                        upstream.provider_type,
+                        response.status_code,
+                        model_id,
+                        extra={
+                            "status_code": response.status_code,
+                            "provider": upstream.provider_type,
+                            "model": model_id,
+                        },
+                    )
+                    continue
+
+                # 4xx error (user error), or other non-retryable error, or last provider failed
+                await revert_pay_for_request(key, session, max_cost_for_model)
+                logger.warning(
+                    "Upstream request failed, revert payment "
+                    "(provider=%s model=%s status=%s path=%s)",
+                    upstream.provider_type,
+                    model_id,
+                    response.status_code,
+                    path,
+                    extra={
+                        "status_code": response.status_code,
+                        "path": path,
+                        "provider": upstream.provider_type,
+                        "model": model_id,
+                        "key_hash": key.hashed_key[:8] + "...",
+                        "key_balance": key.balance,
+                        "max_cost_for_model": max_cost_for_model,
+                    },
+                )
+                return response
+
+            return response
+
+        except asyncio.CancelledError:
+            logger.warning(
+                "Client disconnected mid-request, reverting reservation",
+                extra={
+                    "path": path,
+                    "model": model_id,
+                    "key_hash": key.hashed_key[:8] + "...",
+                    "max_cost_for_model": max_cost_for_model,
+                },
+            )
+            await asyncio.shield(
+                revert_pay_for_request(key, session, max_cost_for_model)
+            )
+            raise
+
+        except UpstreamError as e:
+            logger.warning(
+                "Upstream %s failed for model=%s: %s",
+                upstream.provider_type,
+                model_id,
+                e,
+                extra={
+                    "provider": upstream.provider_type,
+                    "model": model_id,
+                    "status_code": e.status_code,
+                    "retry": i < len(upstreams) - 1,
+                },
+            )
+
+            # If this was the last provider
+            if i == len(upstreams) - 1:
+                await revert_pay_for_request(key, session, max_cost_for_model)
+                return create_error_response(
+                    "upstream_error", str(e), 502, request=request
+                )
+
+            # Otherwise loop continues to next provider
+            continue
+
+    # Should not be reached given logic above
+    return create_error_response(
+        "upstream_error", "All upstreams failed", 502, request=request
+    )
+
+
+async def get_bearer_token_key(
+    headers: dict,
+    path: str,
+    session: AsyncSession,
+    auth: str,
+    min_cost: int = 0,
+    model_id: str = "unknown",
+) -> ApiKey:
+    """Handle bearer token authentication proxy requests."""
+    parts = auth.split()
+    bearer_key = parts[1] if len(parts) > 1 and parts[0].lower() == "bearer" else ""
+    refund_address = headers.get("Refund-LNURL", None)
+    key_expiry_time = headers.get("Key-Expiry-Time", None)
+
+    logger.debug(
+        "Processing bearer token",
+        extra={
+            "path": path,
+            "has_refund_address": bool(refund_address),
+            "has_expiry_time": bool(key_expiry_time),
+            "bearer_key_preview": bearer_key[:20] + "..."
+            if len(bearer_key) > 20
+            else bearer_key,
+            "min_cost": min_cost,
+        },
+    )
+
+    # Validate key_expiry_time header
+    if key_expiry_time:
+        try:
+            key_expiry_time = int(key_expiry_time)  # type: ignore
+            logger.debug(
+                "Key expiry time validated",
+                extra={"expiry_time": key_expiry_time, "path": path},
+            )
+        except ValueError:
+            logger.error(
+                "Invalid Key-Expiry-Time header",
+                extra={"key_expiry_time": key_expiry_time, "path": path},
+            )
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid Key-Expiry-Time: must be a valid Unix timestamp",
+            )
+        if not refund_address:
+            logger.error(
+                "Missing Refund-LNURL header with Key-Expiry-Time",
+                extra={"path": path, "expiry_time": key_expiry_time},
+            )
+            raise HTTPException(
+                status_code=400,
+                detail="Error: Refund-LNURL header required when using Key-Expiry-Time",
+            )
+    else:
+        key_expiry_time = None
+
+    try:
+        key = await validate_bearer_key(
+            bearer_key,
+            session,
+            refund_address,
+            key_expiry_time,  # type: ignore
+            min_cost=min_cost,
+        )
+        logger.info(
+            "Bearer token validated successfully",
+            extra={
+                "path": path,
+                "key_hash": key.hashed_key[:8] + "...",
+                "key_balance": key.balance,
+            },
+        )
+        return key
+    except Exception as e:
+        key_preview = bearer_key[:20] + "..." if len(bearer_key) > 20 else bearer_key
+        logger.error(
+            f"Bearer token validation failed: {type(e).__name__}: {e} path={path} model={model_id!r} min_cost={min_cost} key={key_preview!r}",
+            extra={
+                "error": str(e),
+                "error_type": type(e).__name__,
+                "path": path,
+                "model_id": model_id,
+                "min_cost_msat": min_cost,
+                "bearer_key_preview": key_preview,
+            },
+        )
+        raise
+
+
+def extract_model_from_responses_request(request_body_dict: dict[str, Any]) -> str:
+    if model := request_body_dict.get("model"):
+        return model
+
+    if input_data := request_body_dict.get("input"):
+        if isinstance(input_data, dict) and (model := input_data.get("model")):
+            return model
+
+    if request_body_dict.get("messages"):
+        return "unknown"
+
+    logger.warning(
+        "No model found in Responses API request",
+        extra={"body_keys": list(request_body_dict.keys())},
+    )
+    return "unknown"
+
+
+def parse_request_body_json(request_body: bytes, path: str) -> dict[str, Any]:
+    request_body_dict = {}
+    if request_body:
+        try:
+            request_body_dict = json.loads(request_body)
+
+            if "max_tokens" in request_body_dict:
+                max_tokens_value = request_body_dict["max_tokens"]
+
+                if isinstance(max_tokens_value, int):
+                    pass
+                else:
+                    raise HTTPException(
+                        status_code=400,
+                        detail={"error": "max_tokens must be an integer"},
+                    )
+
+            logger.debug(
+                "Request body parsed",
+                extra={
+                    "path": path,
+                    "body_keys": list(request_body_dict.keys()),
+                    "model": request_body_dict.get("model", "not_specified"),
+                },
+            )
+        except json.JSONDecodeError as e:
+            logger.error(
+                "Invalid JSON in request body",
+                extra={
+                    "error": str(e),
+                    "path": path,
+                    "body_preview": request_body[:200].decode(errors="ignore")
+                    if request_body
+                    else "empty",
+                },
+            )
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": {"type": "invalid_request_error", "code": "invalid_json"}
+                },
+            )
+
+    return request_body_dict

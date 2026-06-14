@@ -1,0 +1,48 @@
+services:
+  ui:
+    env_file:
+      - .env
+    build:
+      context: ./ui
+      dockerfile: Dockerfile.build
+      args:
+        # NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://127.0.0.1:8000}
+        NEXT_PUBLIC_ADMIN_API_KEY: ${NEXT_PUBLIC_ADMIN_API_KEY:-}
+    user: root
+    volumes:
+      - ./ui_out:/output:z
+    command:
+      ["sh", "-c", "mkdir -p /output && cp -r /app/built/. /output/ && echo 'UI build copied to mounted volume' && ls -la /output/ && echo 'UI built and ready' && tail -f /dev/null"]
+
+  routstr:
+    build: .
+    depends_on:
+      - ui
+    volumes:
+      - .:/app:z
+      - ./logs:/app/logs:z
+      - ./models.json:/app/models.json:ro
+      - tor-data:/var/lib/tor:ro
+      - ./ui_out:/app/ui_out:ro,z
+    env_file:
+      - .env
+    environment:
+      - TOR_PROXY_URL=socks5://tor:9050
+    ports:
+      - 8000:8000
+    extra_hosts: # Needed to access locally running models
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  tor:
+    image: ghcr.io/hundehausen/tor-hidden-service:latest
+    volumes:
+      - tor-data:/var/lib/tor
+    environment:
+      # Format: HS_<NAME>=<TARGET_HOST>:<TARGET_PORT>:<VIRTUAL_PORT>
+      - HS_ROUTER=routstr:8000:80
+    depends_on:
+      - routstr
+
+volumes:
+  tor-data:

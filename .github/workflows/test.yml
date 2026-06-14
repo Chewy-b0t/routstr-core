@@ -1,0 +1,88 @@
+name: Run Tests
+
+on:
+  push:
+    branches: ["*"] # Run on all branches
+  pull_request:
+    branches: ["*"] # Run on PRs to all branches
+
+jobs:
+  backend-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          uv sync --dev
+
+      - name: Run linting with ruff
+        run: |
+          uv run ruff check .
+
+      - name: Run type checking with mypy
+        run: |
+          uv run mypy .
+
+      - name: Run tests with pytest
+        env:
+          UPSTREAM_BASE_URL: "http://test"
+          UPSTREAM_API_KEY: "test"
+        run: |
+          uv run pytest --verbose --tb=short
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.python-version }}
+          path: |
+            pytest.xml
+            .coverage
+          retention-days: 30
+
+  ui-build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "pnpm"
+          cache-dependency-path: ui/pnpm-lock.yaml
+
+      - name: Install UI dependencies
+        working-directory: ./ui
+        run: pnpm install --frozen-lockfile
+
+      - name: Run UI format check
+        working-directory: ./ui
+        run: pnpm run format-check
+
+      - name: Run UI linting
+        working-directory: ./ui
+        run: pnpm run lint
+
+      - name: Run UI build
+        working-directory: ./ui
+        run: pnpm run build

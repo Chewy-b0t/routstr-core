@@ -1,0 +1,53 @@
+# Multi-stage Dockerfile for Routstr (includes UI build)
+# Stage 1: Build the UI
+FROM node:23-alpine AS ui-builder
+WORKDIR /app/ui
+
+# Install pnpm
+RUN corepack enable pnpm && corepack prepare pnpm@10.15.0 --activate
+
+# Copy UI source
+COPY ui/package.json ui/pnpm-lock.yaml* ./
+RUN pnpm install --frozen-lockfile
+
+COPY ui/ ./
+ENV NEXT_TELEMETRY_DISABLED=1
+# Next.js build produces a static export in 'out' directory
+RUN pnpm run build
+
+# Stage 2: Build the Routstr Node
+FROM ghcr.io/astral-sh/uv:python3.11-bookworm-slim AS runner
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        git \
+        build-essential \
+        pkg-config \
+        libsecp256k1-dev \
+        autoconf \
+        automake \
+        libtool \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY uv.lock pyproject.toml ./
+
+RUN uv sync --no-dev --no-install-project
+
+WORKDIR /app
+
+COPY . .
+
+# Copy the built UI from the ui-builder stage
+COPY --from=ui-builder /app/ui/out ./ui_out
+
+ARG GIT_COMMIT=""
+ARG GIT_TAG=""
+ENV GIT_COMMIT=${GIT_COMMIT}
+ENV GIT_TAG=${GIT_TAG}
+ENV PORT=8000
+ENV PYTHONUNBUFFERED=1
+
+EXPOSE 8000
+
+# Run the application
+CMD ["/.venv/bin/fastapi", "run", "routstr", "--host", "0.0.0.0"]

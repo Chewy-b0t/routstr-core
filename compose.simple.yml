@@ -1,0 +1,14 @@
+services:
+  routstr:
+    build: .
+    volumes:
+      - .:/app:z
+      - ./logs:/app/logs:z
+      - ./models.json:/app/models.json:ro
+    env_file:
+      - .env
+    ports:
+      - 8000:8000
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped

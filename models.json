@@ -1,0 +1,58 @@
+{
+    "models": [
+        {
+            "id": "qwen3.5:4b",
+            "name": "Qwen 3.5 4B (Local)",
+            "context_length": 32768,
+            "pricing": {
+                "prompt": "0.00002",
+                "completion": "0.00002"
+            }
+        },
+        {
+            "id": "qwen2.5:7b",
+            "name": "Qwen 2.5 7B (Local)",
+            "context_length": 32768,
+            "pricing": {
+                "prompt": "0.00003",
+                "completion": "0.00003"
+            }
+        },
+        {
+            "id": "deepseek-r1:8b",
+            "name": "DeepSeek R1 8B (Local)",
+            "context_length": 32768,
+            "pricing": {
+                "prompt": "0.00003",
+                "completion": "0.00003"
+            }
+        },
+        {
+            "id": "qwen2.5-coder:7b",
+            "name": "Qwen 2.5 Coder 7B (Local)",
+            "context_length": 32768,
+            "pricing": {
+                "prompt": "0.00003",
+                "completion": "0.00003"
+            }
+        },
+        {
+            "id": "qwen3.5:9b",
+            "name": "Qwen 3.5 9B (Local)",
+            "context_length": 32768,
+            "pricing": {
+                "prompt": "0.00004",
+                "completion": "0.00004"
+            }
+        },
+        {
+            "id": "qwen2.5:14b",
+            "name": "Qwen 2.5 14B (Local)",
+            "context_length": 32768,
+            "pricing": {
+                "prompt": "0.00005",
+                "completion": "0.00005"
+            }
+        }
+    ]
+}

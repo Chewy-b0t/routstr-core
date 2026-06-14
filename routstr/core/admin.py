@@ -1,0 +1,1655 @@
+import asyncio
+import json
+import secrets
+from datetime import datetime, timezone
+from pathlib import Path
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from pydantic import BaseModel, RootModel
+from pydantic.v1 import ValidationError as PydanticValidationError
+from sqlmodel import select
+
+from ..payment.models import _row_to_model, list_models
+from ..proxy import refresh_model_maps, reinitialize_upstreams
+from ..wallet import (
+    fetch_all_balances,
+    get_proofs_per_mint_and_unit,
+    get_wallet,
+    send_token,
+    slow_filter_spend_proofs,
+)
+from .db import (
+    ApiKey,
+    CashuTransaction,
+    CliToken,
+    LightningInvoice,
+    ModelRow,
+    UpstreamProviderRow,
+    create_session,
+)
+from .log_manager import log_manager
+from .logging import get_logger
+from .settings import SettingsService, settings
+
+logger = get_logger(__name__)
+
+admin_router = APIRouter(prefix="/admin", include_in_schema=False)
+
+admin_sessions: dict[str, int] = {}
+ADMIN_SESSION_DURATION = 3600
+# Usage analytics remain queryable up to 12 months.
+MAX_USAGE_ANALYTICS_HOURS = 365 * 24
+
+
+async def require_admin_api(request: Request) -> None:
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=403, detail="Unauthorized")
+
+    token = auth_header.split(" ", 1)[1]
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+
+    # 1) Short-lived session token (in-memory)
+    expiry = admin_sessions.get(token)
+    if expiry and expiry > now_ts:
+        return
+
+    # 2) Long-lived CLI token (DB-backed)
+    async with create_session() as session:
+        result = await session.exec(select(CliToken).where(CliToken.token == token))
+        cli_token = result.first()
+        if cli_token and (cli_token.expires_at is None or cli_token.expires_at > now_ts):
+            cli_token.last_used_at = now_ts
+            session.add(cli_token)
+            await session.commit()
+            return
+
+    raise HTTPException(status_code=403, detail="Unauthorized")
+
+
+@admin_router.get("/api/temporary-balances", dependencies=[Depends(require_admin_api)])
+async def get_temporary_balances_api(
+    request: Request,
+    search: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict[str, object]:
+    from sqlalchemy import case
+    from sqlmodel import col, func
+
+    filters = []
+    if search:
+        pattern = f"%{search}%"
+        filters.append(
+            col(ApiKey.hashed_key).like(pattern)
+            | col(ApiKey.refund_address).like(pattern)
+        )
+
+    async with create_session() as session:
+        base = select(ApiKey).where(*filters)
+
+        count_result = await session.exec(
+            select(func.count()).select_from(base.subquery())
+        )
+        total = count_result.one()
+
+        # Aggregate totals across the whole (search-filtered) set, not just the
+        # current page. Balance counts only parent (non-child) keys to avoid
+        # double-counting, since child keys draw from their parent's balance.
+        totals_result = await session.exec(
+            select(
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (col(ApiKey.parent_key_hash).is_(None), ApiKey.balance),
+                            else_=0,
+                        )
+                    ),
+                    0,
+                ),
+                func.coalesce(func.sum(ApiKey.total_spent), 0),
+                func.coalesce(func.sum(ApiKey.total_requests), 0),
+            ).where(*filters)
+        )
+        total_balance, total_spent, total_requests = totals_result.one()
+
+        # Latest created first; keys with no created_at (legacy rows) sort last.
+        # Use an explicit CASE rather than relying on dialect NULL-ordering so
+        # the behaviour is identical on SQLite and Postgres.
+        stmt = (
+            base.order_by(
+                case((col(ApiKey.created_at).is_(None), 1), else_=0),
+                col(ApiKey.created_at).desc(),
+            )
+            .offset(offset)
+            .limit(limit)
+        )
+        result = await session.exec(stmt)
+        api_keys = result.all()
+
+    return {
+        "balances": [
+            {
+                "hashed_key": key.hashed_key,
+                "balance": key.balance,
+                "total_spent": key.total_spent,
+                "total_requests": key.total_requests,
+                "refund_address": key.refund_address,
+                "key_expiry_time": key.key_expiry_time,
+                "parent_key_hash": key.parent_key_hash,
+                "balance_limit": key.balance_limit,
+                "balance_limit_reset": key.balance_limit_reset,
+                "validity_date": key.validity_date,
+                "created_at": key.created_at,
+            }
+            for key in api_keys
+        ],
+        "total": total,
+        "totals": {
+            "total_balance": total_balance,
+            "total_spent": total_spent,
+            "total_requests": total_requests,
+        },
+    }
+
+
+class ApiKeyUpdate(BaseModel):
+    balance_limit: int | None = None
+    balance_limit_reset: str | None = None
+    validity_date: int | None = None
+
+
+@admin_router.patch(
+    "/api/apikeys/{hashed_key}", dependencies=[Depends(require_admin_api)]
+)
+async def update_apikey(
+    request: Request, hashed_key: str, update: ApiKeyUpdate
+) -> dict:
+    async with create_session() as session:
+        key = await session.get(ApiKey, hashed_key)
+        if not key:
+            raise HTTPException(status_code=404, detail="API key not found")
+
+        if update.balance_limit is not None:
+            key.balance_limit = update.balance_limit
+        if update.balance_limit_reset is not None:
+            key.balance_limit_reset = update.balance_limit_reset
+        if update.validity_date is not None:
+            key.validity_date = update.validity_date
+
+        session.add(key)
+        await session.commit()
+        await session.refresh(key)
+
+    return {
+        "hashed_key": key.hashed_key,
+        "balance_limit": key.balance_limit,
+        "balance_limit_reset": key.balance_limit_reset,
+        "validity_date": key.validity_date,
+    }
+
+
+@admin_router.get("/api/balances", dependencies=[Depends(require_admin_api)])
+async def get_balances_api(request: Request) -> list[dict[str, object]]:
+    balance_details, _tw, _tu, _ow = await fetch_all_balances()
+    return [dict(d) for d in balance_details]
+
+
+@admin_router.get("/api/settings", dependencies=[Depends(require_admin_api)])
+async def get_settings(request: Request) -> dict:
+    data = settings.dict()
+    if "upstream_api_key" in data:
+        data["upstream_api_key"] = "[REDACTED]" if data["upstream_api_key"] else ""
+    if "admin_password" in data:
+        data["admin_password"] = "[REDACTED]" if data["admin_password"] else ""
+    if "nsec" in data:
+        data["nsec"] = "[REDACTED]" if data["nsec"] else ""
+    return data
+
+
+class SettingsUpdate(RootModel[dict[str, object]]):
+    pass
+
+
+class PasswordUpdate(BaseModel):
+    current_password: str
+    new_password: str
+
+
+@admin_router.patch("/api/settings", dependencies=[Depends(require_admin_api)])
+async def update_settings(request: Request, update: SettingsUpdate) -> dict:
+    # Remove sensitive fields from general settings update
+    settings_data = update.root.copy()
+    sensitive_fields = ["admin_password", "upstream_api_key", "nsec"]
+    for field in sensitive_fields:
+        if field in settings_data:
+            del settings_data[field]
+
+    try:
+        async with create_session() as session:
+            new_settings = await SettingsService.update(settings_data, session)
+    except PydanticValidationError as e:
+        # Surface validation issues (e.g. non-positive payout amounts)
+        # as a clean 400 instead of a 500.
+        raise HTTPException(status_code=400, detail=e.errors()) from e
+    data = new_settings.dict()
+    if "upstream_api_key" in data:
+        data["upstream_api_key"] = "[REDACTED]" if data["upstream_api_key"] else ""
+    if "admin_password" in data:
+        data["admin_password"] = "[REDACTED]" if data["admin_password"] else ""
+    if "nsec" in data:
+        data["nsec"] = "[REDACTED]" if data["nsec"] else ""
+    return data
+
+
+@admin_router.patch("/api/password", dependencies=[Depends(require_admin_api)])
+async def update_password(request: Request, password_update: PasswordUpdate) -> dict:
+    current_password = settings.admin_password
+
+    if not current_password:
+        raise HTTPException(status_code=500, detail="Admin password not configured")
+
+    if password_update.current_password != current_password:
+        raise HTTPException(status_code=401, detail="Current password is incorrect")
+
+    # Validate new password
+    new_password = password_update.new_password.strip()
+    if len(new_password) < 6:
+        raise HTTPException(
+            status_code=400, detail="New password must be at least 6 characters"
+        )
+
+    # Update password
+    async with create_session() as session:
+        await SettingsService.update({"admin_password": new_password}, session)
+
+    return {"ok": True, "message": "Password updated successfully"}
+
+
+class SetupRequest(BaseModel):
+    password: str
+
+
+@admin_router.post("/api/setup")
+async def initial_setup(request: Request, payload: SetupRequest) -> dict[str, object]:
+    if settings.admin_password:
+        raise HTTPException(status_code=409, detail="Admin password already set")
+    pw = (payload.password or "").strip()
+    if len(pw) < 8:
+        raise HTTPException(
+            status_code=400, detail="Password must be at least 8 characters"
+        )
+    async with create_session() as session:
+        await SettingsService.update({"admin_password": pw}, session)
+    return {"ok": True}
+
+
+class AdminLoginRequest(BaseModel):
+    password: str
+
+
+@admin_router.post("/api/login")
+async def admin_login(
+    request: Request, payload: AdminLoginRequest
+) -> dict[str, object]:
+    admin_pw = settings.admin_password
+
+    if not admin_pw:
+        raise HTTPException(status_code=500, detail="Admin password not configured")
+
+    if payload.password != admin_pw:
+        raise HTTPException(status_code=401, detail="Invalid password")
+
+    token = secrets.token_urlsafe(32)
+    expiry_timestamp = (
+        int(datetime.now(timezone.utc).timestamp()) + ADMIN_SESSION_DURATION
+    )
+    admin_sessions[token] = expiry_timestamp
+
+    expired_tokens = [
+        t
+        for t, exp in admin_sessions.items()
+        if exp <= int(datetime.now(timezone.utc).timestamp())
+    ]
+    for t in expired_tokens:
+        del admin_sessions[t]
+
+    return {"ok": True, "token": token, "expires_in": ADMIN_SESSION_DURATION}
+
+
+@admin_router.post("/api/logout", dependencies=[Depends(require_admin_api)])
+async def admin_logout(request: Request) -> dict[str, object]:
+    auth_header = request.headers.get("Authorization")
+    if auth_header and auth_header.startswith("Bearer "):
+        token = auth_header.split(" ", 1)[1]
+        if token in admin_sessions:
+            del admin_sessions[token]
+
+    return {"ok": True}
+
+
+# ─── CLI Tokens (long-lived bearer tokens for CLI/agent use) ───
+
+
+class CliTokenCreate(BaseModel):
+    name: str
+    expires_in_days: int | None = None
+
+
+@admin_router.get("/api/cli-tokens", dependencies=[Depends(require_admin_api)])
+async def list_cli_tokens() -> list[dict[str, object]]:
+    async with create_session() as session:
+        result = await session.exec(select(CliToken))
+        tokens = result.all()
+    return [
+        {
+            "id": t.id,
+            "name": t.name,
+            "token_preview": f"{t.token[:8]}...{t.token[-4:]}",
+            "created_at": t.created_at,
+            "last_used_at": t.last_used_at,
+            "expires_at": t.expires_at,
+        }
+        for t in tokens
+    ]
+
+
+@admin_router.post("/api/cli-tokens", dependencies=[Depends(require_admin_api)])
+async def create_cli_token(payload: CliTokenCreate) -> dict[str, object]:
+    name = (payload.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Name is required")
+
+    raw_token = secrets.token_urlsafe(32)
+    expires_at: int | None = None
+    if payload.expires_in_days is not None and payload.expires_in_days > 0:
+        expires_at = int(datetime.now(timezone.utc).timestamp()) + (
+            payload.expires_in_days * 86400
+        )
+
+    async with create_session() as session:
+        cli_token = CliToken(token=raw_token, name=name, expires_at=expires_at)
+        session.add(cli_token)
+        await session.commit()
+        await session.refresh(cli_token)
+
+    return {
+        "id": cli_token.id,
+        "name": cli_token.name,
+        "token": raw_token,  # full token returned only on creation
+        "created_at": cli_token.created_at,
+        "expires_at": cli_token.expires_at,
+    }
+
+
+@admin_router.delete(
+    "/api/cli-tokens/{token_id}", dependencies=[Depends(require_admin_api)]
+)
+async def revoke_cli_token(token_id: str) -> dict[str, object]:
+    async with create_session() as session:
+        cli_token = await session.get(CliToken, token_id)
+        if not cli_token:
+            raise HTTPException(status_code=404, detail="Token not found")
+        await session.delete(cli_token)
+        await session.commit()
+    return {"ok": True, "deleted_id": token_id}
+
+
+class WithdrawRequest(BaseModel):
+    amount: int
+    mint_url: str | None = None
+    unit: str = "sat"
+
+
+@admin_router.post("/withdraw", dependencies=[Depends(require_admin_api)])
+async def withdraw(
+    request: Request, withdraw_request: WithdrawRequest
+) -> dict[str, str]:
+    # Get wallet and check balance
+    from .settings import settings as global_settings
+
+    wallet = await get_wallet(
+        withdraw_request.mint_url or global_settings.primary_mint, withdraw_request.unit
+    )
+    proofs = get_proofs_per_mint_and_unit(
+        wallet,
+        withdraw_request.mint_url or global_settings.primary_mint,
+        withdraw_request.unit,
+        not_reserved=True,
+    )
+    proofs = await slow_filter_spend_proofs(proofs, wallet)
+    current_balance = sum(proof.amount for proof in proofs)
+
+    if withdraw_request.amount <= 0:
+        raise HTTPException(
+            status_code=400, detail="Withdrawal amount must be positive"
+        )
+
+    if withdraw_request.amount > current_balance:
+        raise HTTPException(status_code=400, detail="Insufficient wallet balance")
+
+    token = await send_token(
+        withdraw_request.amount, withdraw_request.unit, withdraw_request.mint_url
+    )
+    return {"token": token}
+
+
+class ModelCreate(BaseModel):
+    id: str
+    name: str
+    description: str
+    created: int
+    context_length: int
+    architecture: dict[str, object]
+    pricing: dict[str, object]
+    per_request_limits: dict[str, object] | None = None
+    top_provider: dict[str, object] | None = None
+    upstream_provider_id: int | None = None
+    canonical_slug: str | None = None
+    alias_ids: list[str] | None = None
+    enabled: bool = True
+    forwarded_model_id: str | None = None
+
+
+@admin_router.post(
+    "/api/upstream-providers/{provider_id}/models",
+    dependencies=[Depends(require_admin_api)],
+)
+async def upsert_provider_model(
+    provider_id: int, payload: ModelCreate
+) -> dict[str, object]:
+    print(payload)
+    logger.info(
+        f"UPSERT_PROVIDER_MODEL called: provider_id={provider_id}, model_id={payload.id}"
+    )
+    async with create_session() as session:
+        provider = await session.get(UpstreamProviderRow, provider_id)
+        if not provider:
+            raise HTTPException(status_code=404, detail="Provider not found")
+
+        # Try to get existing model
+        existing_row = await session.get(ModelRow, (payload.id, provider_id))
+
+        if existing_row:
+            # Update existing model
+            logger.info(f"Updating existing model: {payload.id}")
+            existing_row.name = payload.name
+            existing_row.description = payload.description
+            existing_row.created = int(payload.created)
+            existing_row.context_length = int(payload.context_length)
+            existing_row.architecture = json.dumps(payload.architecture)
+            existing_row.pricing = json.dumps(payload.pricing)
+            existing_row.sats_pricing = None
+            existing_row.per_request_limits = (
+                json.dumps(payload.per_request_limits)
+                if payload.per_request_limits is not None
+                else None
+            )
+            existing_row.top_provider = (
+                json.dumps(payload.top_provider) if payload.top_provider else None
+            )
+            existing_row.canonical_slug = payload.canonical_slug
+            existing_row.alias_ids = (
+                json.dumps(payload.alias_ids) if payload.alias_ids else None
+            )
+            existing_row.enabled = payload.enabled
+            existing_row.forwarded_model_id = payload.forwarded_model_id or payload.id
+
+            session.add(existing_row)
+            await session.commit()
+            await session.refresh(existing_row)
+            row = existing_row
+
+        else:
+            # Create new model
+            logger.info(f"Creating new model: {payload.id}")
+            row = ModelRow(
+                id=payload.id,
+                name=payload.name,
+                description=payload.description,
+                created=int(payload.created),
+                context_length=int(payload.context_length),
+                architecture=json.dumps(payload.architecture),
+                pricing=json.dumps(payload.pricing),
+                sats_pricing=None,
+                per_request_limits=(
+                    json.dumps(payload.per_request_limits)
+                    if payload.per_request_limits is not None
+                    else None
+                ),
+                top_provider=(
+                    json.dumps(payload.top_provider) if payload.top_provider else None
+                ),
+                canonical_slug=payload.canonical_slug,
+                alias_ids=(
+                    json.dumps(payload.alias_ids) if payload.alias_ids else None
+                ),
+                upstream_provider_id=provider_id,
+                enabled=payload.enabled,
+                forwarded_model_id=payload.forwarded_model_id or payload.id,
+            )
+            session.add(row)
+            await session.commit()
+            await session.refresh(row)
+
+    await refresh_model_maps()
+    return _row_to_model(
+        row, apply_provider_fee=True, provider_fee=provider.provider_fee
+    ).dict()  # type: ignore
+
+
+@admin_router.patch(
+    "/api/upstream-providers/{provider_id}/models/{model_id:path}",
+    dependencies=[Depends(require_admin_api)],
+)
+async def update_provider_model_legacy(
+    provider_id: int, model_id: str, payload: ModelCreate
+) -> dict[str, object]:
+    """Legacy PATCH endpoint - redirects to upsert POST endpoint for backward compatibility."""
+    logger.info(
+        f"LEGACY_PATCH_UPDATE called: provider_id={provider_id}, model_id={model_id}"
+    )
+    return await upsert_provider_model(provider_id, payload)
+
+
+@admin_router.get(
+    "/api/upstream-providers/{provider_id}/models/{model_id:path}",
+    dependencies=[Depends(require_admin_api)],
+)
+async def get_provider_model(provider_id: int, model_id: str) -> dict[str, object]:
+    async with create_session() as session:
+        provider = await session.get(UpstreamProviderRow, provider_id)
+        if not provider:
+            raise HTTPException(status_code=404, detail="Provider not found")
+
+        row = await session.get(ModelRow, (model_id, provider_id))
+        if not row:
+            raise HTTPException(
+                status_code=404, detail="Model not found for this provider"
+            )
+        return _row_to_model(
+            row, apply_provider_fee=False, provider_fee=provider.provider_fee
+        ).dict()  # type: ignore
+
+
+@admin_router.delete(
+    "/api/upstream-providers/{provider_id}/models/{model_id:path}",
+    dependencies=[Depends(require_admin_api)],
+)
+async def delete_provider_model(provider_id: int, model_id: str) -> dict[str, object]:
+    async with create_session() as session:
+        row = await session.get(ModelRow, (model_id, provider_id))
+        if not row:
+            raise HTTPException(
+                status_code=404, detail="Model not found for this provider"
+            )
+        await session.delete(row)
+        await session.commit()
+    await refresh_model_maps()
+    return {"ok": True, "deleted_id": model_id}
+
+
+@admin_router.delete(
+    "/api/upstream-providers/{provider_id}/models",
+    dependencies=[Depends(require_admin_api)],
+)
+async def delete_all_provider_models(provider_id: int) -> dict[str, object]:
+    async with create_session() as session:
+        result = await session.exec(
+            select(ModelRow).where(ModelRow.upstream_provider_id == provider_id)
+        )  # type: ignore
+        rows = result.all()
+        for row in rows:
+            await session.delete(row)  # type: ignore
+        await session.commit()
+    await refresh_model_maps()
+    return {"ok": True, "deleted": len(rows)}
+
+
+class BatchOverrideRequest(BaseModel):
+    models: list[ModelCreate]
+
+
+@admin_router.post(
+    "/api/upstream-providers/{provider_id}/batch-override",
+    dependencies=[Depends(require_admin_api)],
+)
+async def batch_override_provider_models(
+    provider_id: int, payload: BatchOverrideRequest
+) -> dict[str, object]:
+    """Batch override models for a specific provider."""
+    logger.info(
+        f"BATCH_OVERRIDE called: provider_id={provider_id}, count={len(payload.models)}"
+    )
+
+    async with create_session() as session:
+        provider = await session.get(UpstreamProviderRow, provider_id)
+        if not provider:
+            raise HTTPException(status_code=404, detail="Provider not found")
+
+        overridden_count = 0
+
+        for model_data in payload.models:
+            # Try to get existing model regardless of whether it's enabled or not
+            existing_row = await session.get(ModelRow, (model_data.id, provider_id))
+
+            if existing_row:
+                # Update existing
+                existing_row.name = model_data.name
+                existing_row.description = model_data.description
+                existing_row.created = int(model_data.created)
+                existing_row.context_length = int(model_data.context_length)
+                existing_row.architecture = json.dumps(model_data.architecture)
+                existing_row.pricing = json.dumps(model_data.pricing)
+                existing_row.sats_pricing = None
+                existing_row.per_request_limits = (
+                    json.dumps(model_data.per_request_limits)
+                    if model_data.per_request_limits is not None
+                    else None
+                )
+                existing_row.top_provider = (
+                    json.dumps(model_data.top_provider)
+                    if model_data.top_provider
+                    else None
+                )
+                existing_row.canonical_slug = model_data.canonical_slug
+                existing_row.alias_ids = (
+                    json.dumps(model_data.alias_ids) if model_data.alias_ids else None
+                )
+                existing_row.enabled = model_data.enabled
+                session.add(existing_row)
+            else:
+                # Create new
+                row = ModelRow(
+                    id=model_data.id,
+                    name=model_data.name,
+                    description=model_data.description,
+                    created=int(model_data.created),
+                    context_length=int(model_data.context_length),
+                    architecture=json.dumps(model_data.architecture),
+                    pricing=json.dumps(model_data.pricing),
+                    sats_pricing=None,
+                    per_request_limits=(
+                        json.dumps(model_data.per_request_limits)
+                        if model_data.per_request_limits is not None
+                        else None
+                    ),
+                    top_provider=(
+                        json.dumps(model_data.top_provider)
+                        if model_data.top_provider
+                        else None
+                    ),
+                    canonical_slug=model_data.canonical_slug,
+                    alias_ids=(
+                        json.dumps(model_data.alias_ids)
+                        if model_data.alias_ids
+                        else None
+                    ),
+                    upstream_provider_id=provider_id,
+                    enabled=model_data.enabled,
+                )
+                session.add(row)
+
+            overridden_count += 1
+
+        await session.commit()
+
+    await refresh_model_maps()
+    return {
+        "ok": True,
+        "count": overridden_count,
+        "message": f"Successfully batch overridden {overridden_count} models",
+    }
+
+
+class UpstreamProviderCreate(BaseModel):
+    provider_type: str
+    base_url: str
+    api_key: str
+    api_version: str | None = None
+    enabled: bool = True
+    provider_fee: float = 1.01
+    provider_settings: dict | None = None
+
+
+class UpstreamProviderUpdate(BaseModel):
+    provider_type: str | None = None
+    base_url: str | None = None
+    api_key: str | None = None
+    api_version: str | None = None
+    enabled: bool | None = None
+    provider_fee: float | None = None
+    provider_settings: dict | None = None
+
+
+@admin_router.get("/api/upstream-providers", dependencies=[Depends(require_admin_api)])
+async def get_upstream_providers() -> list[dict[str, object]]:
+    async with create_session() as session:
+        result = await session.exec(select(UpstreamProviderRow))
+        providers = result.all()
+        return [
+            {
+                "id": p.id,
+                "provider_type": p.provider_type,
+                "base_url": p.base_url,
+                "api_key": "[REDACTED]" if p.api_key else "",
+                "api_version": p.api_version,
+                "enabled": p.enabled,
+                "provider_fee": p.provider_fee,
+                "provider_settings": json.loads(p.provider_settings)
+                if p.provider_settings
+                else None,
+            }
+            for p in providers
+        ]
+
+
+@admin_router.post("/api/upstream-providers", dependencies=[Depends(require_admin_api)])
+async def create_upstream_provider(
+    payload: UpstreamProviderCreate,
+) -> dict[str, object]:
+    async with create_session() as session:
+        result = await session.exec(
+            select(UpstreamProviderRow).where(
+                UpstreamProviderRow.base_url == payload.base_url,
+                UpstreamProviderRow.api_key == payload.api_key,
+            )
+        )
+        if result.first():
+            raise HTTPException(
+                status_code=409,
+                detail="Provider with this base URL and API key already exists",
+            )
+
+        provider = UpstreamProviderRow(
+            provider_type=payload.provider_type,
+            base_url=payload.base_url,
+            api_key=payload.api_key,
+            api_version=payload.api_version,
+            enabled=payload.enabled,
+            provider_fee=payload.provider_fee,
+            provider_settings=json.dumps(payload.provider_settings)
+            if payload.provider_settings
+            else None,
+        )
+        session.add(provider)
+        await session.commit()
+        await session.refresh(provider)
+
+    await reinitialize_upstreams()
+    await refresh_model_maps()
+    return {
+        "id": provider.id,
+        "provider_type": provider.provider_type,
+        "base_url": provider.base_url,
+        "api_key": "[REDACTED]",
+        "api_version": provider.api_version,
+        "enabled": provider.enabled,
+        "provider_fee": provider.provider_fee,
+        "provider_settings": payload.provider_settings,
+    }
+
+
+@admin_router.get(
+    "/api/upstream-providers/{provider_id}", dependencies=[Depends(require_admin_api)]
+)
+async def get_upstream_provider(provider_id: int) -> dict[str, object]:
+    async with create_session() as session:
+        provider = await session.get(UpstreamProviderRow, provider_id)
+        if not provider:
+            raise HTTPException(status_code=404, detail="Provider not found")
+        return {
+            "id": provider.id,
+            "provider_type": provider.provider_type,
+            "base_url": provider.base_url,
+            "api_key": "[REDACTED]" if provider.api_key else "",
+            "api_version": provider.api_version,
+            "enabled": provider.enabled,
+            "provider_fee": provider.provider_fee,
+            "provider_settings": json.loads(provider.provider_settings)
+            if provider.provider_settings
+            else None,
+        }
+
+
+@admin_router.patch(
+    "/api/upstream-providers/{provider_id}", dependencies=[Depends(require_admin_api)]
+)
+async def update_upstream_provider(
+    provider_id: int, payload: UpstreamProviderUpdate
+) -> dict[str, object]:
+    async with create_session() as session:
+        provider = await session.get(UpstreamProviderRow, provider_id)
+        if not provider:
+            raise HTTPException(status_code=404, detail="Provider not found")
+
+        if payload.provider_type is not None:
+            provider.provider_type = payload.provider_type
+        if payload.base_url is not None:
+            provider.base_url = payload.base_url
+        if payload.api_key is not None:
+            provider.api_key = payload.api_key
+        if payload.api_version is not None:
+            provider.api_version = payload.api_version
+        if payload.enabled is not None:
+            provider.enabled = payload.enabled
+        if payload.provider_fee is not None:
+            provider.provider_fee = payload.provider_fee
+        if payload.provider_settings is not None:
+            provider.provider_settings = json.dumps(payload.provider_settings)
+
+        session.add(provider)
+        await session.commit()
+        await session.refresh(provider)
+
+    await reinitialize_upstreams()
+    await refresh_model_maps()
+    return {
+        "id": provider.id,
+        "provider_type": provider.provider_type,
+        "base_url": provider.base_url,
+        "api_key": "[REDACTED]",
+        "api_version": provider.api_version,
+        "enabled": provider.enabled,
+        "provider_fee": provider.provider_fee,
+        "provider_settings": json.loads(provider.provider_settings)
+        if provider.provider_settings
+        else None,
+    }
+
+
+@admin_router.delete(
+    "/api/upstream-providers/{provider_id}", dependencies=[Depends(require_admin_api)]
+)
+async def delete_upstream_provider(provider_id: int) -> dict[str, object]:
+    async with create_session() as session:
+        provider = await session.get(UpstreamProviderRow, provider_id)
+        if not provider:
+            raise HTTPException(status_code=404, detail="Provider not found")
+        await session.delete(provider)
+        await session.commit()
+    await reinitialize_upstreams()
+    await refresh_model_maps()
+    return {"ok": True, "deleted_id": provider_id}
+
+
+@admin_router.get("/api/provider-types", dependencies=[Depends(require_admin_api)])
+async def get_provider_types() -> list[dict[str, object]]:
+    """Get metadata about available provider types including default URLs and whether they're fixed."""
+    from ..upstream import upstream_provider_classes
+
+    return [cls.get_provider_metadata() for cls in upstream_provider_classes]
+
+
+@admin_router.get(
+    "/api/upstream-providers/{provider_id}/models",
+    dependencies=[Depends(require_admin_api)],
+)
+async def get_provider_models(provider_id: int) -> dict[str, object]:
+    from ..upstream.helpers import _instantiate_provider
+
+    async with create_session() as session:
+        provider = await session.get(UpstreamProviderRow, provider_id)
+        if not provider:
+            raise HTTPException(status_code=404, detail="Provider not found")
+
+        db_models = await list_models(
+            session=session,
+            upstream_id=provider_id,
+            include_disabled=True,
+            apply_fees=False,
+        )
+
+        upstream_models = []
+        upstream_instance = _instantiate_provider(provider)
+        if upstream_instance:
+            try:
+                raw_models = await upstream_instance.fetch_models()
+                upstream_models = raw_models
+            except Exception as e:
+                logger.error(
+                    f"Failed to fetch models from {provider.provider_type}: {e}"
+                )
+
+        db_model_ids = {model.id for model in db_models}
+        filtered_remote_models = [
+            m for m in upstream_models if m.id not in db_model_ids
+        ]
+
+        return {
+            "provider": {
+                "id": provider.id,
+                "provider_type": provider.provider_type,
+                "base_url": provider.base_url,
+            },
+            "db_models": [m.dict() for m in db_models],
+            "remote_models": [m.dict() for m in filtered_remote_models],
+        }
+
+
+class CreateAccountRequest(BaseModel):
+    provider_type: str
+
+
+@admin_router.post(
+    "/api/upstream-providers/create-account",
+    dependencies=[Depends(require_admin_api)],
+)
+async def create_provider_account_by_type(
+    payload: CreateAccountRequest,
+) -> dict[str, object]:
+    """Create a new account with a provider by provider type (before provider exists in DB)."""
+    from ..upstream import upstream_provider_classes
+
+    provider_class = next(
+        (
+            cls
+            for cls in upstream_provider_classes
+            if cls.provider_type == payload.provider_type
+        ),
+        None,
+    )
+    if not provider_class:
+        raise HTTPException(status_code=404, detail="Provider type not found")
+
+    try:
+        account_data = await provider_class.create_account_static()
+
+        return {
+            "ok": True,
+            "account_data": account_data,
+            "message": "Account created successfully",
+        }
+    except NotImplementedError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Provider does not support account creation: {str(e)}",
+        )
+    except Exception as e:
+        logger.error(
+            f"Failed to create account for provider type {payload.provider_type}: {e}"
+        )
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class TopupRequest(BaseModel):
+    amount: int
+
+
+class TopupTokenRequest(BaseModel):
+    token: str
+
+
+@admin_router.post(
+    "/api/upstream-providers/{provider_id}/topup-token",
+    dependencies=[Depends(require_admin_api)],
+)
+async def topup_provider_with_token(
+    provider_id: int, payload: TopupTokenRequest
+) -> dict:
+    """Redeem a Cashu token for an upstream provider."""
+    async with create_session() as session:
+        provider = await session.get(UpstreamProviderRow, provider_id)
+        if not provider:
+            raise HTTPException(status_code=404, detail="Provider not found")
+
+        import httpx
+
+        async with httpx.AsyncClient() as client:
+            clean_url = provider.base_url.rstrip("/")
+            headers = {}
+            if provider.api_key:
+                headers["Authorization"] = f"Bearer {provider.api_key}"
+            resp = await client.post(
+                f"{clean_url}/v1/balance/topup",
+                json={"cashu_token": payload.token},
+                headers=headers,
+            )
+
+            if resp.status_code == 200:
+                return {"ok": True, "message": "Token redeemed successfully"}
+            else:
+                logger.error(f"Upstream token topup failed: {resp.text}")
+                try:
+                    error_detail = resp.json()
+                except Exception:
+                    error_detail = resp.text
+                return {"ok": False, "message": f"Upstream error: {error_detail}"}
+
+
+@admin_router.post(
+    "/api/upstream-providers/{provider_id}/topup",
+    dependencies=[Depends(require_admin_api)],
+)
+async def initiate_provider_topup(
+    provider_id: int, payload: TopupRequest
+) -> dict[str, object]:
+    """Initiate a Lightning Network top-up for the upstream provider account."""
+    from ..upstream.helpers import _instantiate_provider
+
+    async with create_session() as session:
+        provider = await session.get(UpstreamProviderRow, provider_id)
+        if not provider:
+            raise HTTPException(status_code=404, detail="Provider not found")
+
+        try:
+            logger.info(
+                f"Initiating top-up for provider {provider_id}",
+                extra={"amount": payload.amount},
+            )
+
+            # For Routstr providers, we might be doing a Lightning top-up or a direct token transfer
+            if provider.provider_type == "routstr":
+                # UI sends sats for Routstr topup
+                import httpx
+
+                async with httpx.AsyncClient() as client:
+                    clean_url = provider.base_url.rstrip("/")
+                    request_json = {
+                        "amount_sats": int(payload.amount),
+                        "purpose": "topup",
+                        "api_key": provider.api_key,
+                    }
+                    headers = (
+                        {"Authorization": f"Bearer {provider.api_key}"}
+                        if provider.api_key
+                        else {}
+                    )
+
+                    last_status_code = 500
+                    last_error_detail: object = "Failed to create top-up invoice"
+
+                    # Some upstream Routstr nodes fail the first invoice request after warm-up
+                    # and succeed immediately on retry. Retry once here so the UI stays single-click.
+                    for attempt in range(2):
+                        resp = await client.post(
+                            f"{clean_url}/v1/balance/lightning/invoice",
+                            json=request_json,
+                            headers=headers,
+                        )
+
+                        if resp.status_code == 200:
+                            data = resp.json()
+                            return {
+                                "ok": True,
+                                "topup_data": {
+                                    "payment_request": data.get("bolt11"),
+                                    "invoice_id": data.get("invoice_id"),
+                                    "status": "pending",
+                                },
+                            }
+
+                        logger.error(
+                            f"Upstream topup request failed: {resp.text}",
+                            extra={
+                                "provider_id": provider_id,
+                                "attempt": attempt + 1,
+                                "status_code": resp.status_code,
+                            },
+                        )
+                        try:
+                            last_error_detail = resp.json()
+                        except Exception:
+                            last_error_detail = resp.text
+                        last_status_code = resp.status_code
+
+                        if resp.status_code < 500 or attempt == 1:
+                            break
+
+                        await asyncio.sleep(0.2)
+
+                    raise HTTPException(
+                        status_code=last_status_code, detail=last_error_detail
+                    )
+
+            upstream_instance = _instantiate_provider(provider)
+            if not upstream_instance:
+                raise HTTPException(
+                    status_code=400, detail="Could not instantiate provider"
+                )
+
+            topup_data = await upstream_instance.initiate_topup(payload.amount)
+
+            logger.info(
+                "Top-up initiated successfully",
+                extra={
+                    "provider_id": provider_id,
+                    "invoice_id": topup_data.invoice_id,
+                    "amount": topup_data.amount,
+                },
+            )
+
+            response_data = {
+                "ok": True,
+                "topup_data": {
+                    "invoice_id": topup_data.invoice_id,
+                    "payment_request": topup_data.payment_request,
+                    "amount": topup_data.amount,
+                    "currency": topup_data.currency,
+                    "expires_at": topup_data.expires_at,
+                    "checkout_url": topup_data.checkout_url,
+                },
+                "message": "Top-up initiated successfully",
+            }
+            logger.info("Returning response", extra={"response": response_data})
+            return response_data
+        except NotImplementedError as e:
+            logger.error(f"Provider does not support top-up: {e}")
+            raise HTTPException(
+                status_code=400, detail=f"Provider does not support top-up: {str(e)}"
+            )
+        except Exception as e:
+            logger.error(
+                f"Failed to initiate top-up for provider {provider_id}: {e}",
+                extra={"error_type": type(e).__name__, "error": str(e)},
+            )
+            raise HTTPException(status_code=500, detail=str(e))
+
+
+@admin_router.get(
+    "/api/upstream-providers/{provider_id}/topup/{invoice_id}/status",
+    dependencies=[Depends(require_admin_api)],
+)
+async def check_topup_status(provider_id: int, invoice_id: str) -> dict[str, object]:
+    """Check the status of a Lightning Network top-up invoice."""
+    from ..upstream.helpers import _instantiate_provider
+    from ..upstream.ppqai import PPQAIUpstreamProvider
+
+    async with create_session() as session:
+        provider = await session.get(UpstreamProviderRow, provider_id)
+        if not provider:
+            raise HTTPException(status_code=404, detail="Provider not found")
+
+        # For Routstr providers, proxy the status check
+        if provider.provider_type == "routstr":
+            import httpx
+
+            async with httpx.AsyncClient() as client:
+                clean_url = provider.base_url.rstrip("/")
+                resp = await client.get(
+                    f"{clean_url}/v1/balance/lightning/invoice/{invoice_id}/status",
+                    headers={"Authorization": f"Bearer {provider.api_key}"}
+                    if provider.api_key
+                    else {},
+                )
+                if resp.status_code == 200:
+                    status_data = resp.json()
+                    return {"ok": True, "paid": status_data.get("status") == "paid"}
+                else:
+                    logger.error(f"Upstream status check failed: {resp.text}")
+                    return {"ok": False, "paid": False}
+
+        upstream_instance = _instantiate_provider(provider)
+        if not upstream_instance:
+            raise HTTPException(
+                status_code=400, detail="Could not instantiate provider"
+            )
+
+        if not isinstance(upstream_instance, PPQAIUpstreamProvider):
+            raise HTTPException(
+                status_code=400,
+                detail="Provider does not support top-up status checking",
+            )
+
+        try:
+            paid = await upstream_instance.check_topup_status(invoice_id)
+            return {"ok": True, "paid": paid}
+        except Exception as e:
+            logger.error(
+                f"Failed to check top-up status for provider {provider_id}: {e}"
+            )
+            raise HTTPException(status_code=500, detail=str(e))
+
+
+@admin_router.get(
+    "/api/upstream-providers/{provider_id}/balance",
+    dependencies=[Depends(require_admin_api)],
+)
+async def get_provider_balance(provider_id: int) -> dict[str, object]:
+    """Get the current balance for an upstream provider account."""
+    from ..upstream.helpers import _instantiate_provider
+
+    async with create_session() as session:
+        provider = await session.get(UpstreamProviderRow, provider_id)
+        if not provider:
+            raise HTTPException(status_code=404, detail="Provider not found")
+
+        # For Routstr providers, proxy the balance check
+        if provider.provider_type == "routstr":
+            import httpx
+
+            clean_url = provider.base_url.rstrip("/")
+            headers = {}
+            if provider.api_key:
+                headers["Authorization"] = f"Bearer {provider.api_key}"
+
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                try:
+                    resp = await client.get(
+                        f"{clean_url}/v1/balance/info",
+                        headers=headers,
+                    )
+                except httpx.TimeoutException as exc:
+                    logger.error(
+                        "Timed out fetching Routstr provider balance",
+                        extra={
+                            "provider_id": provider_id,
+                            "base_url": clean_url,
+                            "upstream_url": f"{clean_url}/v1/balance/info",
+                            "error": str(exc),
+                        },
+                    )
+                    raise HTTPException(
+                        status_code=504,
+                        detail="Timed out contacting upstream Routstr provider",
+                    ) from exc
+                except httpx.RequestError as exc:
+                    logger.error(
+                        "Failed to fetch Routstr provider balance",
+                        extra={
+                            "provider_id": provider_id,
+                            "base_url": clean_url,
+                            "upstream_url": f"{clean_url}/v1/balance/info",
+                            "error": str(exc),
+                        },
+                    )
+                    raise HTTPException(
+                        status_code=502,
+                        detail="Failed to contact upstream Routstr provider",
+                    ) from exc
+
+                if resp.status_code == 200:
+                    data = resp.json()
+                    # Return balance in sats
+                    balance = data.get("balance", 0)
+                    if isinstance(balance, (int, float)):
+                        return {"ok": True, "balance_data": balance // 1000}
+                    return {"ok": True, "balance_data": balance}
+                else:
+                    logger.error(f"Failed to fetch Routstr balance: {resp.text}")
+                    return {"ok": False, "balance_data": None}
+
+        upstream_instance = _instantiate_provider(provider)
+        if not upstream_instance:
+            raise HTTPException(
+                status_code=400, detail="Could not instantiate provider"
+            )
+
+        try:
+            balance_data = await upstream_instance.get_balance()
+            return {"ok": True, "balance_data": balance_data}
+        except NotImplementedError as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Provider does not support balance checking: {str(e)}",
+            )
+        except Exception as e:
+            logger.error(f"Failed to fetch balance for provider {provider_id}: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+
+@admin_router.get(
+    "/api/openrouter-presets",
+    dependencies=[Depends(require_admin_api)],
+)
+async def get_openrouter_presets() -> list[dict[str, object]]:
+    from ..payment.models import async_fetch_openrouter_models
+
+    models_data = await async_fetch_openrouter_models()
+    return models_data
+
+
+@admin_router.get("/api/usage/metrics", dependencies=[Depends(require_admin_api)])
+async def get_usage_metrics(
+    request: Request,
+    interval: int = Query(
+        default=15, ge=1, le=1440, description="Time interval in minutes"
+    ),
+    hours: int = Query(
+        default=24,
+        ge=1,
+        le=MAX_USAGE_ANALYTICS_HOURS,
+        description="Hours of history to analyze",
+    ),
+) -> dict:
+    """Get usage metrics aggregated by time interval."""
+    return log_manager.get_usage_metrics(interval=interval, hours=hours)
+
+
+@admin_router.get("/api/usage/dashboard", dependencies=[Depends(require_admin_api)])
+async def get_usage_dashboard(
+    request: Request,
+    interval: int = Query(
+        default=15, ge=1, le=1440, description="Time interval in minutes"
+    ),
+    hours: int = Query(
+        default=24,
+        ge=1,
+        le=MAX_USAGE_ANALYTICS_HOURS,
+        description="Hours of history to analyze",
+    ),
+    error_limit: int = Query(
+        default=100, ge=1, le=1000, description="Maximum number of errors to return"
+    ),
+    model_limit: int = Query(
+        default=20, ge=1, le=100, description="Maximum number of models to return"
+    ),
+) -> dict:
+    """
+    Get all dashboard analytics in one request.
+    This runs one combined aggregation pass and avoids repeated scans.
+    """
+    return log_manager.get_usage_dashboard(
+        interval=interval,
+        hours=hours,
+        error_limit=error_limit,
+        model_limit=model_limit,
+    )
+
+
+@admin_router.get("/api/usage/summary", dependencies=[Depends(require_admin_api)])
+async def get_usage_summary(
+    request: Request,
+    hours: int = Query(
+        default=24,
+        ge=1,
+        le=MAX_USAGE_ANALYTICS_HOURS,
+        description="Hours of history to analyze",
+    ),
+) -> dict:
+    """Get summary statistics for the specified time period."""
+    return log_manager.get_usage_summary(hours=hours)
+
+
+@admin_router.get("/api/usage/error-details", dependencies=[Depends(require_admin_api)])
+async def get_error_details(
+    request: Request,
+    hours: int = Query(
+        default=24,
+        ge=1,
+        le=MAX_USAGE_ANALYTICS_HOURS,
+        description="Hours of history to analyze",
+    ),
+    limit: int = Query(
+        default=100, ge=1, le=1000, description="Maximum number of errors to return"
+    ),
+) -> dict:
+    """Get detailed error information."""
+    return log_manager.get_error_details(hours=hours, limit=limit)
+
+
+@admin_router.get(
+    "/api/usage/revenue-by-model", dependencies=[Depends(require_admin_api)]
+)
+async def get_revenue_by_model(
+    request: Request,
+    hours: int = Query(
+        default=24,
+        ge=1,
+        le=MAX_USAGE_ANALYTICS_HOURS,
+        description="Hours of history to analyze",
+    ),
+    limit: int = Query(
+        default=20, ge=1, le=100, description="Maximum number of models to return"
+    ),
+) -> dict:
+    """
+    Get revenue breakdown by model.
+    """
+    return log_manager.get_revenue_by_model(hours=hours, limit=limit)
+
+
+@admin_router.get("/api/logs", dependencies=[Depends(require_admin_api)])
+async def get_logs_api(
+    request: Request,
+    date: str | None = None,
+    level: str | None = None,
+    request_id: str | None = None,
+    search: str | None = None,
+    status_codes: str | None = Query(None, description="Comma-separated status codes"),
+    methods: str | None = Query(None, description="Comma-separated HTTP methods"),
+    endpoints: str | None = Query(None, description="Comma-separated endpoints"),
+    limit: int = 100,
+) -> dict[str, object]:
+    """
+    Get filtered log entries.
+
+    Args:
+        date: Filter by specific date (YYYY-MM-DD)
+        level: Filter by log level
+        request_id: Filter by request ID
+        search: Search text in message and name fields (case-insensitive)
+        status_codes: Comma-separated list of HTTP status codes
+        methods: Comma-separated list of HTTP methods
+        endpoints: Comma-separated list of endpoints
+        limit: Maximum number of entries to return
+
+    Returns:
+        Dict containing logs and filter metadata
+    """
+    status_code_list = None
+    if status_codes:
+        try:
+            status_code_list = [int(s.strip()) for s in status_codes.split(",")]
+        except ValueError:
+            pass
+
+    method_list = [m.strip() for m in methods.split(",")] if methods else None
+    endpoint_list = [e.strip() for e in endpoints.split(",")] if endpoints else None
+
+    log_entries = log_manager.search_logs(
+        date=date,
+        level=level,
+        request_id=request_id,
+        search_text=search,
+        status_codes=status_code_list,
+        methods=method_list,
+        endpoints=endpoint_list,
+        limit=limit,
+    )
+
+    return {
+        "logs": log_entries,
+        "total": len(log_entries),
+        "date": date,
+        "level": level,
+        "request_id": request_id,
+        "search": search,
+        "status_codes": status_codes,
+        "methods": methods,
+        "endpoints": endpoints,
+        "limit": limit,
+    }
+
+
+@admin_router.get("/api/logs/dates", dependencies=[Depends(require_admin_api)])
+async def get_log_dates_api(request: Request) -> dict[str, object]:
+    logs_dir = Path("logs")
+    dates = []
+
+    if logs_dir.exists():
+        log_files = sorted(
+            logs_dir.glob("app_*.log"), key=lambda x: x.stat().st_mtime, reverse=True
+        )
+
+        for log_file in log_files[:30]:
+            try:
+                filename = log_file.name
+                date_str = filename.replace("app_", "").replace(".log", "")
+                dates.append(date_str)
+            except Exception:
+                continue
+
+    return {"dates": dates}
+
+
+@admin_router.get("/api/transactions", dependencies=[Depends(require_admin_api)])
+async def get_transactions_api(
+    type: str | None = None,
+    status: str | None = None,
+    search: str | None = None,
+    source: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict:
+    async with create_session() as session:
+        from sqlmodel import col, func
+
+        base = select(CashuTransaction)
+        if type:
+            base = base.where(CashuTransaction.type == type)
+        if source:
+            if source == "x-cashu":
+                base = base.where(
+                    (CashuTransaction.source == "x-cashu")
+                    | (CashuTransaction.source == None)  # noqa: E711
+                )
+            else:
+                base = base.where(CashuTransaction.source == source)
+        if status:
+            if status == "collected":
+                base = base.where(CashuTransaction.collected == True)  # noqa: E712
+            elif status == "swept":
+                base = base.where(CashuTransaction.swept == True)  # noqa: E712
+            elif status == "pending":
+                base = base.where(
+                    CashuTransaction.collected == False,  # noqa: E712
+                    CashuTransaction.swept == False,  # noqa: E712
+                )
+
+        if search:
+            search_pattern = f"%{search}%"
+            base = base.where(
+                (col(CashuTransaction.id).like(search_pattern))
+                | (col(CashuTransaction.token).like(search_pattern))
+                | (col(CashuTransaction.request_id).like(search_pattern))
+                | (col(CashuTransaction.api_key_hashed_key).like(search_pattern))
+            )
+
+        count_result = await session.exec(
+            select(func.count()).select_from(base.subquery())
+        )
+        total = count_result.one()
+
+        stmt = base.order_by(col(CashuTransaction.created_at).desc()).offset(offset).limit(limit)
+        results = await session.exec(stmt)
+        transactions = results.all()
+
+        return {
+            "transactions": [tx.dict() for tx in transactions],
+            "total": total,
+        }
+
+
+@admin_router.get(
+    "/api/lightning-invoices", dependencies=[Depends(require_admin_api)]
+)
+async def get_lightning_invoices_api(
+    status: str | None = None,
+    purpose: str | None = None,
+    search: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict:
+    async with create_session() as session:
+        from sqlmodel import col, func
+
+        base = select(LightningInvoice)
+        if status:
+            base = base.where(LightningInvoice.status == status)
+        if purpose:
+            base = base.where(LightningInvoice.purpose == purpose)
+        if search:
+            pattern = f"%{search}%"
+            base = base.where(
+                (col(LightningInvoice.id).like(pattern))
+                | (col(LightningInvoice.bolt11).like(pattern))
+                | (col(LightningInvoice.payment_hash).like(pattern))
+                | (col(LightningInvoice.api_key_hash).like(pattern))
+            )
+
+        count_result = await session.exec(
+            select(func.count()).select_from(base.subquery())
+        )
+        total = count_result.one()
+
+        stmt = (
+            base.order_by(col(LightningInvoice.created_at).desc())
+            .offset(offset)
+            .limit(limit)
+        )
+        results = await session.exec(stmt)
+        invoices = results.all()
+
+        return {
+            "invoices": [inv.dict() for inv in invoices],
+            "total": total,
+        }
+
+
+@admin_router.post(
+    "/api/upstream-providers/{provider_id}/routstr/refund",
+    dependencies=[Depends(require_admin_api)],
+)
+async def refund_routstr_provider_balance(provider_id: int) -> dict[str, object]:
+    """Refund balance from an upstream Routstr provider back to the local wallet."""
+    from ..upstream.helpers import _instantiate_provider
+    from ..upstream.routstr import RoutstrUpstreamProvider
+
+    async with create_session() as session:
+        provider_row = await session.get(UpstreamProviderRow, provider_id)
+        if not provider_row:
+            raise HTTPException(status_code=404, detail="Provider not found")
+
+        if provider_row.provider_type != "routstr":
+            raise HTTPException(
+                status_code=400, detail="Refund only supported for Routstr providers"
+            )
+
+        provider = _instantiate_provider(provider_row)
+        if not isinstance(provider, RoutstrUpstreamProvider):
+            raise HTTPException(status_code=400, detail="Invalid provider instance")
+
+        try:
+            # Request refund from upstream
+            data = await provider.refund_balance()
+            if "error" in data:
+                # If the upstream returned an OpenAI-style error (like the model unknown error)
+                # it means the request likely didn't even reach the refund endpoint handler
+                # but was intercepted by the proxy layer.
+                error_info = data.get("error", {})
+                message = (
+                    error_info.get("message")
+                    if isinstance(error_info, dict)
+                    else str(error_info)
+                )
+                return {
+                    "ok": False,
+                    "message": f"Upstream refund failed: {message}",
+                }
+
+            token = data.get("token")
+            if not token:
+                return {"ok": False, "message": "Upstream did not return a token"}
+
+            # Receive token into local wallet
+            from ..wallet import recieve_token
+
+            try:
+                # Use current wallet to receive
+                await recieve_token(token)
+                return {
+                    "ok": True,
+                    "message": "Successfully received refund from upstream provider",
+                }
+            except Exception as e:
+                logger.error(f"Failed to receive refund token: {e}")
+                return {
+                    "ok": False,
+                    "message": f"Failed to receive refund token: {str(e)}",
+                    "token": token,
+                }
+
+        except Exception as e:
+            logger.exception(f"Refund failed for provider {provider_id}")
+            raise HTTPException(status_code=500, detail=str(e))

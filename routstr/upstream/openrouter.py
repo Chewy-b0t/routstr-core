@@ -1,0 +1,111 @@
+from typing import TYPE_CHECKING
+
+import httpx
+
+from ..payment.models import Model, async_fetch_openrouter_models
+from .base import BaseUpstreamProvider
+
+if TYPE_CHECKING:
+    from ..core.db import UpstreamProviderRow
+
+
+class OpenRouterUpstreamProvider(BaseUpstreamProvider):
+    """Upstream provider specifically configured for OpenRouter API."""
+
+    provider_type = "openrouter"
+    default_base_url = "https://openrouter.ai/api/v1"
+    platform_url = "https://openrouter.ai/settings/keys"
+    supports_anthropic_messages = True
+    litellm_provider_prefix = "openrouter/"
+
+    def _apply_provider_field(self, response_json: object) -> None:
+        """Stamp the ``provider`` field for OpenRouter responses.
+
+        OpenRouter is a router, not the real serving provider, so a bare
+        ``"openrouter"`` value carries no useful information. Rules:
+
+        - Real upstream sub-provider (e.g. ``"GMICloud"``) -> ``"openrouter:GMICloud"``.
+        - Missing sub-provider, or one that merely echoes ``"openrouter"`` ->
+          ``"unknown"``.
+        - Idempotent: re-stamping never produces ``"openrouter:openrouter:..."``;
+          the ``openrouter:`` prefix appears at most once.
+        """
+        if not isinstance(response_json, dict):
+            return
+        provider_type = (self.provider_type or "").strip()
+        existing = response_json.get("provider")
+        sub = existing.strip() if isinstance(existing, str) else ""
+        # Strip any already-applied "openrouter:" prefixes (idempotency).
+        prefix = f"{provider_type}:"
+        while sub.lower().startswith(prefix.lower()):
+            sub = sub[len(prefix) :].strip()
+        # No real sub-provider, or it just echoes our own router name.
+        if not sub or sub.lower() == provider_type.lower():
+            response_json["provider"] = "unknown"
+            return
+        response_json["provider"] = f"{provider_type}:{sub}"
+
+    def __init__(self, api_key: str, provider_fee: float = 1.06):
+        """Initialize OpenRouter provider with API key.
+
+        Args:
+            api_key: OpenRouter API key for authentication
+            provider_fee: Provider fee multiplier (default 1.06 for 6% fee)
+        """
+        super().__init__(
+            base_url=self.default_base_url, api_key=api_key, provider_fee=provider_fee
+        )
+
+    @classmethod
+    def from_db_row(
+        cls, provider_row: "UpstreamProviderRow"
+    ) -> "OpenRouterUpstreamProvider":
+        return cls(
+            api_key=provider_row.api_key,
+            provider_fee=provider_row.provider_fee,
+        )
+
+    @classmethod
+    def get_provider_metadata(cls) -> dict[str, object]:
+        return {
+            "id": cls.provider_type,
+            "name": "OpenRouter",
+            "default_base_url": cls.default_base_url,
+            "fixed_base_url": True,
+            "platform_url": cls.platform_url,
+            "can_show_balance": True,
+        }
+
+    async def fetch_models(self) -> list[Model]:
+        """Fetch all OpenRouter models."""
+        models_data = await async_fetch_openrouter_models()
+        models = [Model(**model) for model in models_data]  # type: ignore
+        # manual alias for openai/text-embedding-ada-002 due to openrouter api bug
+        for model in models:
+            if model.id == "openai/text-embedding-ada-002":
+                model.alias_ids = ["text-embedding-ada-002-v2"]
+                break
+        return models
+
+    async def get_balance(self) -> float | None:
+        """Get the current account balance from OpenRouter.
+
+        Returns:
+            Float representing the balance amount (in credits/USD), or None if unavailable.
+        """
+        url = f"{self.base_url}/credits"
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get(url, headers=headers)
+                response.raise_for_status()
+                data = response.json()
+
+                credits_data = data.get("data", {})
+                total_credits = float(credits_data.get("total_credits", 0.0))
+                total_usage = float(credits_data.get("total_usage", 0.0))
+
+                return total_credits - total_usage
+        except Exception:
+            return None

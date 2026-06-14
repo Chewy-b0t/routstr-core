@@ -1,0 +1,1246 @@
+import { apiClient } from '../client';
+import { z } from 'zod';
+
+export const ProviderTypeSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  default_base_url: z.string(),
+  fixed_base_url: z.boolean(),
+  platform_url: z.string().nullable(),
+  can_create_account: z.boolean(),
+  can_topup: z.boolean(),
+  can_show_balance: z.boolean(),
+});
+
+export const UpstreamProviderSchema = z.object({
+  id: z.number(),
+  provider_type: z.string(),
+  base_url: z.string(),
+  api_key: z.string().optional(),
+  api_version: z.string().nullable().optional(),
+  enabled: z.boolean(),
+  provider_fee: z.number().optional(),
+  provider_settings: z.record(z.string(), z.any()).nullable().optional(),
+});
+
+export const CreateUpstreamProviderSchema = z.object({
+  provider_type: z.string(),
+  base_url: z.string(),
+  api_key: z.string(),
+  api_version: z.string().nullable().optional(),
+  enabled: z.boolean().default(true),
+  provider_fee: z.number().optional(),
+  provider_settings: z.record(z.string(), z.any()).nullable().optional(),
+});
+
+export const UpdateUpstreamProviderSchema = z.object({
+  provider_type: z.string().optional(),
+  base_url: z.string().optional(),
+  api_key: z.string().optional(),
+  api_version: z.string().nullable().optional(),
+  enabled: z.boolean().optional(),
+  provider_fee: z.number().optional(),
+  provider_settings: z.record(z.string(), z.any()).nullable().optional(),
+});
+
+export const AdminModelPricingSchema = z.object({
+  prompt: z.number().optional(),
+  completion: z.number().optional(),
+  request: z.number().optional(),
+  image: z.number().optional(),
+  web_search: z.number().optional(),
+  internal_reasoning: z.number().optional(),
+});
+
+export const AdminModelArchitectureSchema = z.object({
+  modality: z.string().optional(),
+  input_modalities: z.array(z.string()).optional(),
+  output_modalities: z.array(z.string()).optional(),
+  tokenizer: z.string().optional(),
+  instruct_type: z.string().nullable().optional(),
+});
+
+export const AdminModelSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  description: z.string(),
+  created: z.number(),
+  context_length: z.number(),
+  architecture: AdminModelArchitectureSchema.or(
+    z.record(z.string(), z.unknown())
+  ),
+  pricing: AdminModelPricingSchema.or(z.record(z.string(), z.unknown())),
+  per_request_limits: z.record(z.string(), z.unknown()).nullable().optional(),
+  top_provider: z.record(z.string(), z.unknown()).nullable().optional(),
+  upstream_provider_id: z.union([z.string(), z.number()]).nullable().optional(),
+  canonical_slug: z.string().nullable().optional(),
+  alias_ids: z.array(z.string()).nullable().optional(),
+  enabled: z.boolean().default(true),
+  forwarded_model_id: z.string().nullable().optional(),
+});
+
+export const ProviderModelsSchema = z.object({
+  provider: z.object({
+    id: z.number(),
+    provider_type: z.string(),
+    base_url: z.string(),
+  }),
+  db_models: z.array(AdminModelSchema),
+  remote_models: z.array(AdminModelSchema),
+});
+
+export type ProviderType = z.infer<typeof ProviderTypeSchema>;
+export type UpstreamProvider = z.infer<typeof UpstreamProviderSchema>;
+export type CreateUpstreamProvider = z.infer<
+  typeof CreateUpstreamProviderSchema
+>;
+export type UpdateUpstreamProvider = z.infer<
+  typeof UpdateUpstreamProviderSchema
+>;
+export type AdminModel = z.infer<typeof AdminModelSchema>;
+export type AdminModelPricing = z.infer<typeof AdminModelPricingSchema>;
+export type AdminModelArchitecture = z.infer<
+  typeof AdminModelArchitectureSchema
+>;
+export type ProviderModels = z.infer<typeof ProviderModelsSchema>;
+
+export interface AdminModelAsModel {
+  id: string;
+  name: string;
+  full_name: string;
+  description?: string;
+  modelType: string;
+  isEnabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+  provider: string;
+  url: string;
+  api_key?: string;
+  input_cost: number;
+  output_cost: number;
+  min_cost_per_request: number;
+  min_cash_per_request: number;
+  contextLength?: number;
+  apiKeyRequired: boolean;
+  provider_id?: string;
+  is_free: boolean;
+  soft_deleted?: boolean;
+  has_own_api_key: boolean;
+  api_key_type: string;
+  alias_ids?: string[] | null;
+}
+
+export interface AdminModelGroup {
+  id: string;
+  provider: string;
+  group_api_key?: string;
+  group_url?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export class AdminService {
+  static convertPricingToPerMillionTokens(
+    pricing: Record<string, unknown>
+  ): Record<string, unknown> {
+    if (!pricing) return pricing;
+    const result = { ...pricing };
+
+    // Only prompt and completion are per-token and need scaling to per-1M
+    const convertField = (field: string) => {
+      const val = result[field];
+      if (val !== undefined && val !== null) {
+        const num = typeof val === 'string' ? parseFloat(val) : (val as number);
+        if (!isNaN(num)) {
+          // Multiply by 1M and round to avoid floating point artifacts (e.g. 0.40399999999999997)
+          // 9 decimals is plenty for USD/1M tokens (0.000000001)
+          result[field] = parseFloat((num * 1000000).toFixed(9));
+        }
+      }
+    };
+
+    convertField('prompt');
+    convertField('completion');
+
+    // Other fields (request, image, etc.) are already flat fees (per item)
+    // so we do NOT scale them.
+
+    return result;
+  }
+
+  static convertPricingToPerToken(
+    pricing: Record<string, unknown>
+  ): Record<string, unknown> {
+    if (!pricing) return pricing;
+    const result = { ...pricing };
+
+    // Only prompt and completion are per-1M in UI and need scaling down to per-token
+    const convertField = (field: string) => {
+      const val = result[field];
+      if (val !== undefined && val !== null) {
+        const num = typeof val === 'string' ? parseFloat(val) : (val as number);
+        if (!isNaN(num)) {
+          result[field] = num / 1000000;
+        }
+      }
+    };
+
+    convertField('prompt');
+    convertField('completion');
+
+    // Other fields stay as flat fees
+
+    return result;
+  }
+
+  static transformAdminModelToModel(
+    adminModel: AdminModel,
+    providerName?: string
+  ): AdminModelAsModel {
+    // Callers normalize prompt/completion to the UI's "per 1M tokens" unit
+    // before they pass models into this mapper.
+    const pricing = adminModel.pricing as Record<string, unknown>;
+    const inputCost = (pricing?.prompt as number) || 0;
+    const outputCost = (pricing?.completion as number) || 0;
+    const requestCost = (pricing?.request as number) || 0;
+
+    return {
+      id: adminModel.id,
+      name: adminModel.name,
+      full_name: adminModel.name,
+      description: adminModel.description,
+      modelType:
+        ((adminModel.architecture as Record<string, unknown>)
+          ?.modality as string) || 'text',
+      isEnabled: adminModel.enabled,
+      createdAt: new Date(adminModel.created * 1000).toISOString(),
+      updatedAt: new Date(adminModel.created * 1000).toISOString(),
+      provider: providerName || 'Unknown',
+      url: '',
+      api_key: undefined,
+      input_cost: inputCost,
+      output_cost: outputCost,
+      min_cost_per_request: requestCost,
+      min_cash_per_request: 0,
+      contextLength: adminModel.context_length,
+      apiKeyRequired: true,
+      provider_id: adminModel.upstream_provider_id?.toString(),
+      is_free: inputCost === 0 && outputCost === 0,
+      soft_deleted: !adminModel.enabled,
+      has_own_api_key: false,
+      api_key_type: 'group',
+      alias_ids: adminModel.alias_ids,
+    };
+  }
+
+  static transformModelToAdminModel(model: AdminModelAsModel): AdminModel {
+    const pricing = this.convertPricingToPerToken({
+      prompt: model.input_cost,
+      completion: model.output_cost,
+      request: model.min_cost_per_request,
+      image: 0,
+      web_search: 0,
+      internal_reasoning: 0,
+    });
+    return {
+      id: model.id,
+      name: model.name,
+      description: model.description || '',
+      created: Math.floor(new Date(model.createdAt).getTime() / 1000),
+      context_length: model.contextLength || 0,
+      architecture: {
+        modality: model.modelType,
+        input_modalities: [model.modelType],
+        output_modalities: [model.modelType],
+        tokenizer: '',
+        instruct_type: null,
+      },
+      pricing,
+      per_request_limits: null,
+      top_provider: null,
+      upstream_provider_id: model.provider_id
+        ? parseInt(model.provider_id)
+        : null,
+      enabled: model.isEnabled,
+    };
+  }
+
+  static async getProviderTypes(): Promise<ProviderType[]> {
+    return await apiClient.get<ProviderType[]>('/admin/api/provider-types');
+  }
+
+  static async getUpstreamProviders(): Promise<UpstreamProvider[]> {
+    return await apiClient.get<UpstreamProvider[]>(
+      '/admin/api/upstream-providers'
+    );
+  }
+
+  static async getUpstreamProvider(id: number): Promise<UpstreamProvider> {
+    return await apiClient.get<UpstreamProvider>(
+      `/admin/api/upstream-providers/${id}`
+    );
+  }
+
+  static async createUpstreamProvider(
+    data: CreateUpstreamProvider
+  ): Promise<UpstreamProvider> {
+    return await apiClient.post<UpstreamProvider>(
+      '/admin/api/upstream-providers',
+      data
+    );
+  }
+
+  static async updateUpstreamProvider(
+    id: number,
+    data: UpdateUpstreamProvider
+  ): Promise<UpstreamProvider> {
+    return await apiClient.patch<UpstreamProvider>(
+      `/admin/api/upstream-providers/${id}`,
+      data
+    );
+  }
+
+  static async deleteUpstreamProvider(
+    id: number
+  ): Promise<{ ok: boolean; deleted_id: number }> {
+    return await apiClient.delete<{ ok: boolean; deleted_id: number }>(
+      `/admin/api/upstream-providers/${id}`
+    );
+  }
+
+  static async getProviderModels(providerId: number): Promise<ProviderModels> {
+    const data = await apiClient.get<ProviderModels>(
+      `/admin/api/upstream-providers/${providerId}/models`
+    );
+
+    // Convert pricing for all models in the list so the UI receives "per 1M tokens" values
+    return {
+      ...data,
+      db_models: data.db_models.map((m) => ({
+        ...m,
+        pricing: this.convertPricingToPerMillionTokens(m.pricing),
+      })),
+      remote_models: data.remote_models.map((m) => ({
+        ...m,
+        pricing: this.convertPricingToPerMillionTokens(m.pricing),
+      })),
+    };
+  }
+
+  static async createProviderModel(
+    providerId: number,
+    data: AdminModel
+  ): Promise<AdminModel> {
+    const payload = {
+      ...data,
+      pricing: this.convertPricingToPerToken(data.pricing),
+    };
+    const model = await apiClient.post<AdminModel>(
+      `/admin/api/upstream-providers/${providerId}/models`,
+      payload
+    );
+    return {
+      ...model,
+      pricing: this.convertPricingToPerMillionTokens(model.pricing),
+    };
+  }
+
+  static async batchOverrideProviderModels(
+    providerId: number,
+    models: AdminModel[]
+  ): Promise<{ ok: boolean; count: number; message: string }> {
+    const payload = {
+      models: models.map((m) => ({
+        ...m,
+        pricing: this.convertPricingToPerToken(m.pricing),
+      })),
+    };
+    return await apiClient.post<{
+      ok: boolean;
+      count: number;
+      message: string;
+    }>(`/admin/api/upstream-providers/${providerId}/batch-override`, payload);
+  }
+
+  static async getProviderModel(
+    providerId: number,
+    modelId: string
+  ): Promise<AdminModel> {
+    const model = await apiClient.get<AdminModel>(
+      `/admin/api/upstream-providers/${providerId}/models/${encodeURIComponent(modelId)}`
+    );
+    return {
+      ...model,
+      pricing: this.convertPricingToPerMillionTokens(model.pricing),
+    };
+  }
+
+  static async getModel(
+    modelId: string,
+    providerId: number | null = null
+  ): Promise<AdminModel> {
+    const model = await apiClient.post<AdminModel>('/admin/api/models/get', {
+      model_id: modelId,
+      provider_id: providerId,
+    });
+    return {
+      ...model,
+      pricing: this.convertPricingToPerMillionTokens(model.pricing),
+    };
+  }
+
+  static async updateProviderModel(
+    providerId: number,
+    modelId: string,
+    data: AdminModel
+  ): Promise<AdminModel> {
+    void modelId;
+    const payload = {
+      ...data,
+      pricing: this.convertPricingToPerToken(data.pricing),
+    };
+    // Use the same POST endpoint for both create and update (upsert)
+    const model = await apiClient.post<AdminModel>(
+      `/admin/api/upstream-providers/${providerId}/models`,
+      payload
+    );
+    return {
+      ...model,
+      pricing: this.convertPricingToPerMillionTokens(model.pricing),
+    };
+  }
+
+  static async deleteProviderModel(
+    providerId: number,
+    modelId: string
+  ): Promise<{ ok: boolean; deleted_id: string }> {
+    return await apiClient.delete<{ ok: boolean; deleted_id: string }>(
+      `/admin/api/upstream-providers/${providerId}/models/${encodeURIComponent(modelId)}`
+    );
+  }
+
+  static async getModelsWithProviders(): Promise<{
+    models: AdminModelAsModel[];
+    groups: AdminModelGroup[];
+  }> {
+    const providers = await this.getUpstreamProviders();
+
+    const groups: AdminModelGroup[] = providers.map((p) => ({
+      id: p.id.toString(),
+      provider: p.provider_type,
+      group_api_key: p.api_key,
+      group_url: p.base_url,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    }));
+
+    const allModels: AdminModelAsModel[] = [];
+    const seenModelIds = new Set<string>();
+
+    for (const provider of providers) {
+      try {
+        const providerModels = await this.getProviderModels(provider.id);
+
+        providerModels.db_models.forEach((dbModel) => {
+          seenModelIds.add(dbModel.id);
+          const modelWithProvider = {
+            ...dbModel,
+            upstream_provider_id: provider.id,
+          };
+          allModels.push({
+            ...this.transformAdminModelToModel(
+              modelWithProvider,
+              provider.provider_type
+            ),
+            has_own_api_key: false,
+            api_key_type: 'group',
+          });
+        });
+
+        providerModels.remote_models.forEach((remoteModel) => {
+          if (!seenModelIds.has(remoteModel.id)) {
+            const modelWithProvider = {
+              ...remoteModel,
+              upstream_provider_id: provider.id,
+            };
+            allModels.push({
+              ...this.transformAdminModelToModel(
+                modelWithProvider,
+                provider.provider_type
+              ),
+              has_own_api_key: false,
+              api_key_type: 'remote',
+              soft_deleted: false,
+            });
+          }
+        });
+      } catch (error) {
+        console.error(
+          `Failed to fetch models for provider ${provider.id}:`,
+          error
+        );
+      }
+    }
+
+    return { models: allModels, groups };
+  }
+
+  static async createModelGroup(data: {
+    provider: string;
+    group_api_key?: string;
+    group_url?: string;
+  }): Promise<AdminModelGroup> {
+    const provider = await this.createUpstreamProvider({
+      provider_type: data.provider,
+      base_url: data.group_url || '',
+      api_key: data.group_api_key || '',
+      enabled: true,
+    });
+    return {
+      id: provider.id.toString(),
+      provider: provider.provider_type,
+      group_api_key: provider.api_key,
+      group_url: provider.base_url,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+  }
+
+  static async updateModelGroup(
+    id: string,
+    data: { provider?: string; group_api_key?: string; group_url?: string }
+  ): Promise<AdminModelGroup> {
+    const provider = await this.updateUpstreamProvider(parseInt(id), {
+      provider_type: data.provider,
+      base_url: data.group_url,
+      api_key: data.group_api_key,
+    });
+    return {
+      id: provider.id.toString(),
+      provider: provider.provider_type,
+      group_api_key: provider.api_key,
+      group_url: provider.base_url,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+  }
+
+  static async createModel(
+    data: Record<string, unknown>
+  ): Promise<AdminModelAsModel> {
+    const providerId = data.provider_id
+      ? parseInt(data.provider_id as string)
+      : null;
+
+    const pricing = {
+      prompt: data.input_cost as number,
+      completion: data.output_cost as number,
+      request: (data.min_cost_per_request as number) || 0,
+      image: 0,
+      web_search: 0,
+      internal_reasoning: 0,
+    };
+
+    const modelId = data.id as string;
+
+    const payload = {
+      model_id: modelId,
+      provider_id: providerId,
+      name: (data.name as string) || (data.full_name as string),
+      description: (data.description as string) || '',
+      created: Math.floor(Date.now() / 1000),
+      context_length: (data.contextLength as number) || 0,
+      architecture: {
+        modality: (data.modelType as string) || 'text',
+        input_modalities: [(data.modelType as string) || 'text'],
+        output_modalities: [(data.modelType as string) || 'text'],
+        tokenizer: '',
+        instruct_type: null,
+      },
+      pricing: this.convertPricingToPerToken(pricing),
+      per_request_limits: null,
+      top_provider: null,
+      enabled: data.isEnabled !== false,
+    };
+
+    const created = await apiClient.post<AdminModel>(
+      '/admin/api/models/create',
+      payload
+    );
+
+    return this.transformAdminModelToModel(
+      {
+        ...created,
+        pricing: this.convertPricingToPerMillionTokens(created.pricing),
+      },
+      data.provider as string
+    );
+  }
+
+  static async updateModel(
+    modelId: string,
+    data: Record<string, unknown>
+  ): Promise<AdminModelAsModel> {
+    const providerId = data.provider_id
+      ? parseInt(data.provider_id as string)
+      : null;
+
+    const existingModel = await this.getModel(modelId, providerId);
+
+    const pricing = {
+      prompt: data.input_cost as number,
+      completion: data.output_cost as number,
+      request: (data.min_cost_per_request as number) || 0,
+      image: 0,
+      web_search: 0,
+      internal_reasoning: 0,
+    };
+
+    const payload: AdminModel & {
+      model_id: string;
+      provider_id: number | null;
+    } = {
+      ...existingModel,
+      model_id: modelId,
+      provider_id: providerId,
+      pricing,
+    };
+
+    if (data.name) payload.name = data.name as string;
+    if (data.description) payload.description = data.description as string;
+    if (data.contextLength !== undefined)
+      payload.context_length = data.contextLength as number;
+    if (data.isEnabled !== undefined)
+      payload.enabled = data.isEnabled as boolean;
+
+    const updated = await apiClient.post<AdminModel>(
+      '/admin/api/models/update',
+      {
+        ...payload,
+        pricing: this.convertPricingToPerToken(payload.pricing),
+      }
+    );
+
+    return this.transformAdminModelToModel(
+      {
+        ...updated,
+        pricing: this.convertPricingToPerMillionTokens(updated.pricing),
+      },
+      data.provider as string
+    );
+  }
+
+  static async deleteModel(
+    modelId: string,
+    providerId?: string
+  ): Promise<{ message: string }> {
+    const providerIdNum = providerId ? parseInt(providerId) : null;
+    await apiClient.post('/admin/api/models/delete', {
+      model_id: modelId,
+      provider_id: providerIdNum,
+    });
+    return { message: 'Model deleted successfully' };
+  }
+
+  static async softDeleteModel(
+    modelId: string,
+    providerId?: string
+  ): Promise<{ message: string }> {
+    const providerIdNum = providerId ? parseInt(providerId) : null;
+    const model = await this.getModel(modelId, providerIdNum);
+
+    await apiClient.post('/admin/api/models/update', {
+      model_id: modelId,
+      provider_id: providerIdNum,
+      ...model,
+      enabled: false,
+      pricing: this.convertPricingToPerToken(model.pricing),
+    });
+
+    return { message: 'Model soft deleted successfully' };
+  }
+
+  static async deleteModels(
+    modelIds: string[],
+    providerId?: string
+  ): Promise<{ deleted_count: number; message: string }> {
+    if (!providerId) {
+      throw new Error('provider_id is required to delete models');
+    }
+    const providerIdNum = parseInt(providerId);
+    for (const id of modelIds) {
+      await this.deleteProviderModel(providerIdNum, id);
+    }
+    return {
+      deleted_count: modelIds.length,
+      message: 'Models deleted successfully',
+    };
+  }
+
+  static async softDeleteModels(
+    modelIds: string[],
+    providerId?: string
+  ): Promise<{ deleted_count: number; message: string }> {
+    if (!providerId) {
+      throw new Error('provider_id is required to soft delete models');
+    }
+    const providerIdNum = parseInt(providerId);
+    for (const id of modelIds) {
+      const model = await this.getProviderModel(providerIdNum, id);
+      await this.updateProviderModel(providerIdNum, id, {
+        ...model,
+        enabled: false,
+      });
+    }
+    return {
+      deleted_count: modelIds.length,
+      message: 'Models soft deleted successfully',
+    };
+  }
+
+  static async bulkUpdateModels(
+    modelIds: string[],
+    updates: { api_key?: string; url?: string },
+    providerId?: string
+  ): Promise<{
+    updated_count: number;
+    total_count: number;
+    message: string;
+    errors: string[];
+  }> {
+    if (!providerId) {
+      throw new Error('provider_id is required for bulk updates');
+    }
+    void updates;
+
+    const errors: string[] = [];
+    let updated_count = 0;
+    const providerIdNum = parseInt(providerId);
+
+    for (const id of modelIds) {
+      try {
+        const model = await this.getProviderModel(providerIdNum, id);
+        await this.updateProviderModel(providerIdNum, id, model);
+        updated_count++;
+      } catch (error: unknown) {
+        const errorMessage =
+          error instanceof Error ? error.message : 'Unknown error';
+        errors.push(`Failed to update ${id}: ${errorMessage}`);
+      }
+    }
+
+    return {
+      updated_count,
+      total_count: modelIds.length,
+      message: 'Bulk update completed',
+      errors,
+    };
+  }
+
+  static async restoreModels(
+    modelIds: string[],
+    providerId?: string
+  ): Promise<{ restored_count: number; message: string }> {
+    if (!providerId) {
+      throw new Error('provider_id is required to restore models');
+    }
+    const providerIdNum = parseInt(providerId);
+    for (const id of modelIds) {
+      const model = await this.getProviderModel(providerIdNum, id);
+      await this.updateProviderModel(providerIdNum, id, {
+        ...model,
+        enabled: true,
+      });
+    }
+    return {
+      restored_count: modelIds.length,
+      message: 'Models restored successfully',
+    };
+  }
+
+  static async refreshAllModels(): Promise<{ message: string }> {
+    return { message: 'Refresh not implemented for admin API' };
+  }
+
+  static async refreshModels(data: {
+    provider_id: string;
+  }): Promise<{ message: string }> {
+    void data;
+    return { message: 'Refresh not implemented for admin API' };
+  }
+
+  static async getOpenRouterPresets(): Promise<AdminModel[]> {
+    const presets = await apiClient.get<AdminModel[]>(
+      '/admin/api/openrouter-presets'
+    );
+    return presets.map((m) => ({
+      ...m,
+      pricing: this.convertPricingToPerMillionTokens(m.pricing),
+    }));
+  }
+
+  static async getSettings(): Promise<Record<string, unknown>> {
+    return await apiClient.get<Record<string, unknown>>('/admin/api/settings');
+  }
+
+  static async updateSettings(
+    settings: Record<string, unknown>
+  ): Promise<Record<string, unknown>> {
+    return await apiClient.patch<Record<string, unknown>>(
+      '/admin/api/settings',
+      settings
+    );
+  }
+
+  static async login(password: string): Promise<{
+    ok: boolean;
+    token: string;
+    expires_in: number;
+  }> {
+    return await apiClient.post<{
+      ok: boolean;
+      token: string;
+      expires_in: number;
+    }>('/admin/api/login', { password });
+  }
+
+  static async logout(): Promise<{ ok: boolean }> {
+    return await apiClient.post<{ ok: boolean }>('/admin/api/logout', {});
+  }
+
+  static async getLogs(
+    date?: string,
+    level?: string,
+    requestId?: string,
+    search?: string,
+    limit: number = 100
+  ): Promise<LogResponse> {
+    const params = new URLSearchParams();
+    if (date) params.append('date', date);
+    if (level) params.append('level', level);
+    if (requestId) params.append('request_id', requestId);
+    if (search) params.append('search', search);
+    params.append('limit', limit.toString());
+
+    return await apiClient.get<LogResponse>(
+      `/admin/api/logs?${params.toString()}`
+    );
+  }
+
+  static async getLogDates(): Promise<{ dates: string[] }> {
+    return await apiClient.get<{ dates: string[] }>('/admin/api/logs/dates');
+  }
+
+  static async getTemporaryBalances(
+    search?: string,
+    limit: number = 50,
+    offset: number = 0
+  ): Promise<TemporaryBalancesResponse> {
+    const params = new URLSearchParams();
+    if (search) params.append('search', search);
+    params.append('limit', limit.toString());
+    params.append('offset', offset.toString());
+
+    return await apiClient.get<TemporaryBalancesResponse>(
+      `/admin/api/temporary-balances?${params.toString()}`
+    );
+  }
+
+  static async getUsageMetrics(
+    interval: number = 15,
+    hours: number = 24
+  ): Promise<UsageMetrics> {
+    return await apiClient.get<UsageMetrics>(
+      `/admin/api/usage/metrics?interval=${interval}&hours=${hours}`
+    );
+  }
+
+  static async getUsageDashboard(
+    hours: number = 24,
+    interval: number = 15,
+    errorLimit: number = 100,
+    modelLimit: number = 20
+  ): Promise<UsageDashboardResponse> {
+    const params = new URLSearchParams();
+    params.set('interval', String(interval));
+    params.set('hours', String(hours));
+    params.set('error_limit', String(errorLimit));
+    params.set('model_limit', String(modelLimit));
+
+    return await apiClient.get<UsageDashboardResponse>(
+      `/admin/api/usage/dashboard?${params.toString()}`
+    );
+  }
+
+  static async getUsageSummary(hours: number = 24): Promise<UsageSummary> {
+    return await apiClient.get<UsageSummary>(
+      `/admin/api/usage/summary?hours=${hours}`
+    );
+  }
+
+  static async getErrorDetails(
+    hours: number = 24,
+    limit: number = 100
+  ): Promise<ErrorDetails> {
+    return await apiClient.get<ErrorDetails>(
+      `/admin/api/usage/error-details?hours=${hours}&limit=${limit}`
+    );
+  }
+
+  static async getRevenueByModel(
+    hours: number = 24,
+    limit: number = 20
+  ): Promise<RevenueByModel> {
+    return await apiClient.get<RevenueByModel>(
+      `/admin/api/usage/revenue-by-model?hours=${hours}&limit=${limit}`
+    );
+  }
+
+  static async getTransactions(
+    type?: string,
+    status?: string,
+    search?: string,
+    source?: string,
+    limit: number = 50,
+    offset: number = 0
+  ): Promise<TransactionsResponse> {
+    const params = new URLSearchParams();
+    if (type) params.append('type', type);
+    if (status) params.append('status', status);
+    if (search) params.append('search', search);
+    if (source) params.append('source', source);
+    params.append('limit', limit.toString());
+    params.append('offset', offset.toString());
+
+    return await apiClient.get<TransactionsResponse>(
+      `/admin/api/transactions?${params.toString()}`
+    );
+  }
+
+  static async getLightningInvoices(
+    status?: string,
+    purpose?: string,
+    search?: string,
+    limit: number = 50,
+    offset: number = 0
+  ): Promise<LightningInvoicesResponse> {
+    const params = new URLSearchParams();
+    if (status) params.append('status', status);
+    if (purpose) params.append('purpose', purpose);
+    if (search) params.append('search', search);
+    params.append('limit', limit.toString());
+    params.append('offset', offset.toString());
+
+    return await apiClient.get<LightningInvoicesResponse>(
+      `/admin/api/lightning-invoices?${params.toString()}`
+    );
+  }
+
+  static async createProviderAccountByType(providerType: string): Promise<{
+    ok: boolean;
+    account_data: Record<string, unknown>;
+    message: string;
+  }> {
+    return await apiClient.post<{
+      ok: boolean;
+      account_data: Record<string, unknown>;
+      message: string;
+    }>('/admin/api/upstream-providers/create-account', {
+      provider_type: providerType,
+    });
+  }
+
+  static async initiateProviderTopup(
+    providerId: number,
+    amount: number
+  ): Promise<{
+    ok: boolean;
+    topup_data: Record<string, unknown>;
+    message: string;
+  }> {
+    return await apiClient.post<{
+      ok: boolean;
+      topup_data: Record<string, unknown>;
+      message: string;
+    }>(`/admin/api/upstream-providers/${providerId}/topup`, { amount });
+  }
+
+  static async topupProviderWithToken(
+    providerId: number,
+    token: string
+  ): Promise<{ ok: boolean; message?: string }> {
+    return await apiClient.post<{ ok: boolean; message?: string }>(
+      `/admin/api/upstream-providers/${providerId}/topup-token`,
+      { token }
+    );
+  }
+
+  static async checkTopupStatus(
+    providerId: number,
+    invoiceId: string
+  ): Promise<{ ok: boolean; paid: boolean }> {
+    return await apiClient.get<{
+      ok: boolean;
+      paid: boolean;
+    }>(`/admin/api/upstream-providers/${providerId}/topup/${invoiceId}/status`);
+  }
+
+  static async getProviderBalance(providerId: number): Promise<{
+    ok: boolean;
+    balance_data: number | null | Record<string, unknown>;
+  }> {
+    return await apiClient.get<{
+      ok: boolean;
+      balance_data: number | null | Record<string, unknown>;
+    }>(`/admin/api/upstream-providers/${providerId}/balance`);
+  }
+
+  // ── CLI Tokens ──
+
+  static async listCliTokens(): Promise<CliTokenListItem[]> {
+    return await apiClient.get<CliTokenListItem[]>('/admin/api/cli-tokens');
+  }
+
+  static async createCliToken(
+    name: string,
+    expiresInDays?: number
+  ): Promise<CliTokenCreated> {
+    return await apiClient.post<CliTokenCreated>('/admin/api/cli-tokens', {
+      name,
+      expires_in_days: expiresInDays ?? null,
+    });
+  }
+
+  static async revokeCliToken(tokenId: string): Promise<{ ok: boolean }> {
+    return await apiClient.delete<{ ok: boolean }>(
+      `/admin/api/cli-tokens/${encodeURIComponent(tokenId)}`
+    );
+  }
+}
+
+export interface CliTokenListItem {
+  id: string;
+  name: string;
+  token_preview: string;
+  created_at: number;
+  last_used_at: number | null;
+  expires_at: number | null;
+}
+
+export interface CliTokenCreated {
+  id: string;
+  name: string;
+  token: string;
+  created_at: number;
+  expires_at: number | null;
+}
+
+export const TemporaryBalanceSchema = z.object({
+  hashed_key: z.string(),
+  balance: z.number(),
+  total_spent: z.number(),
+  total_requests: z.number(),
+  refund_address: z.string().nullable(),
+  key_expiry_time: z.number().nullable(),
+  parent_key_hash: z.string().nullable().optional(),
+  created_at: z.number().nullable().optional(),
+});
+
+export type TemporaryBalance = z.infer<typeof TemporaryBalanceSchema>;
+
+export interface TemporaryBalancesResponse {
+  balances: TemporaryBalance[];
+  total: number;
+  totals: {
+    total_balance: number;
+    total_spent: number;
+    total_requests: number;
+  };
+}
+
+export interface UsageMetricData {
+  timestamp: string;
+  total_requests: number;
+  successful_chat_completions: number;
+  failed_requests: number;
+  errors: number;
+  warnings: number;
+  payment_processed: number;
+  upstream_errors: number;
+  revenue_msats: number;
+  refunds_msats: number;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  [key: string]: unknown;
+}
+
+export interface UsageMetrics {
+  metrics: UsageMetricData[];
+  interval_minutes: number;
+  hours_back: number;
+  total_buckets: number;
+  totals?: {
+    total_requests: number;
+    successful_chat_completions: number;
+    failed_requests: number;
+    errors: number;
+    warnings: number;
+    payment_processed: number;
+    upstream_errors: number;
+    revenue_msats: number;
+    refunds_msats: number;
+    input_tokens: number;
+    output_tokens: number;
+    total_tokens: number;
+  };
+}
+
+export interface UsageSummary {
+  total_entries: number;
+  total_requests: number;
+  successful_chat_completions: number;
+  failed_requests: number;
+  total_errors: number;
+  total_warnings: number;
+  payment_processed: number;
+  upstream_errors: number;
+  unique_models_count: number;
+  unique_models: string[];
+  error_types: Record<string, number>;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  avg_input_tokens_per_completion: number;
+  avg_output_tokens_per_completion: number;
+  avg_total_tokens_per_completion: number;
+  success_rate: number;
+  revenue_msats: number;
+  refunds_msats: number;
+  revenue_sats: number;
+  refunds_sats: number;
+  net_revenue_msats: number;
+  net_revenue_sats: number;
+  avg_revenue_per_request_msats: number;
+  refund_rate: number;
+}
+
+export interface ErrorDetail {
+  timestamp: string;
+  message: string;
+  error_type: string;
+  pathname: string;
+  lineno: number;
+  request_id: string;
+}
+
+export interface ErrorDetails {
+  errors: ErrorDetail[];
+  total_count: number;
+}
+
+export interface ModelRevenueData {
+  model: string;
+  revenue_sats: number;
+  refunds_sats: number;
+  net_revenue_sats: number;
+  requests: number;
+  successful: number;
+  failed: number;
+  avg_revenue_per_request: number;
+}
+
+export interface RevenueByModel {
+  models: ModelRevenueData[];
+  total_revenue_sats: number;
+  total_models: number;
+}
+
+export interface ModelUsageMixMetric {
+  timestamp: string;
+  total_successful: number;
+  total_revenue_msats: number;
+  total_tokens: number;
+  others: number;
+  others_revenue_msats: number;
+  others_tokens: number;
+  model_counts: Record<string, number>;
+  model_revenue_msats: Record<string, number>;
+  model_tokens: Record<string, number>;
+}
+
+export interface ModelUsageMix {
+  top_models: string[];
+  metrics: ModelUsageMixMetric[];
+  interval_minutes: number;
+  hours_back: number;
+  total_buckets: number;
+}
+
+export interface UsageDashboardResponse {
+  metrics: UsageMetrics;
+  summary: UsageSummary;
+  error_details: ErrorDetails;
+  revenue_by_model: RevenueByModel;
+  model_usage_mix?: ModelUsageMix;
+}
+
+export interface LogEntry {
+  asctime: string;
+  name: string;
+  levelname: string;
+  message: string;
+  pathname?: string;
+  lineno?: number;
+  request_id?: string;
+  [key: string]: unknown;
+}
+
+export interface LogResponse {
+  logs: LogEntry[];
+  total: number;
+  date: string | null;
+  level: string | null;
+  request_id: string | null;
+  search: string | null;
+  limit: number;
+}
+
+export interface Transaction {
+  id: string;
+  token: string;
+  amount: number;
+  unit: string;
+  mint_url: string;
+  type: 'in' | 'out';
+  request_id?: string;
+  created_at: number;
+  collected: boolean;
+  swept: boolean;
+  source: 'x-cashu' | 'apikey';
+  api_key_hashed_key?: string;
+}
+
+export interface TransactionsResponse {
+  transactions: Transaction[];
+  total: number;
+}
+
+export interface LightningInvoice {
+  id: string;
+  bolt11: string;
+  amount_sats: number;
+  description: string;
+  payment_hash: string;
+  status: 'pending' | 'paid' | 'expired' | 'cancelled';
+  api_key_hash: string | null;
+  purpose: 'create' | 'topup';
+  created_at: number;
+  expires_at: number;
+  paid_at: number | null;
+}
+
+export interface LightningInvoicesResponse {
+  invoices: LightningInvoice[];
+  total: number;
+}

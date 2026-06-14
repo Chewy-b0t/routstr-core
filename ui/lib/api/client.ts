@@ -1,0 +1,146 @@
+import axios, { AxiosRequestConfig, AxiosResponse, AxiosError } from 'axios';
+import { ConfigurationService } from './services/configuration';
+
+class ApiClient {
+  private getBaseUrl(): string {
+    return ConfigurationService.getLocalBaseUrl();
+  }
+
+  private getHeaders() {
+    return ConfigurationService.getAuthHeaders();
+  }
+
+  private handleAuthError(error: unknown): void {
+    if (axios.isAxiosError(error)) {
+      const axiosError = error as AxiosError;
+      const status = axiosError.response?.status;
+      const requestUrl = axiosError.config?.url ?? '';
+      const isAdminRequest = requestUrl.includes('/admin/');
+
+      if (status === 401 || (status === 403 && isAdminRequest)) {
+        ConfigurationService.clearToken();
+        if (
+          typeof window !== 'undefined' &&
+          window.location.pathname !== '/login'
+        ) {
+          window.location.href = '/login';
+        }
+      }
+    }
+  }
+
+  async get<T>(
+    endpoint: string,
+    params?: Record<string, string | number | boolean | undefined>
+  ): Promise<T> {
+    const config: AxiosRequestConfig = {
+      headers: this.getHeaders(),
+      params,
+      withCredentials: false,
+    };
+
+    try {
+      const response: AxiosResponse<T> = await axios.get<T>(
+        `${this.getBaseUrl()}${endpoint}`,
+        config
+      );
+      return response.data;
+    } catch (error) {
+      this.handleAuthError(error);
+      throw error;
+    }
+  }
+
+  async post<T>(endpoint: string, data: Record<string, unknown>): Promise<T> {
+    const config: AxiosRequestConfig = {
+      headers: this.getHeaders(),
+      withCredentials: false,
+    };
+
+    try {
+      const response: AxiosResponse<T> = await axios.post<T>(
+        `${this.getBaseUrl()}${endpoint}`,
+        data,
+        config
+      );
+      return response.data;
+    } catch (error) {
+      this.handleAuthError(error);
+      console.error(`Error posting to ${endpoint}:`, error);
+      throw error;
+    }
+  }
+
+  async put<T>(endpoint: string, data: Record<string, unknown>): Promise<T> {
+    const config: AxiosRequestConfig = {
+      headers: this.getHeaders(),
+      withCredentials: false,
+    };
+
+    try {
+      const response: AxiosResponse<T> = await axios.put<T>(
+        `${this.getBaseUrl()}${endpoint}`,
+        data,
+        config
+      );
+      return response.data;
+    } catch (error) {
+      this.handleAuthError(error);
+      console.error(`Error updating ${endpoint}:`, error);
+      throw error;
+    }
+  }
+
+  async patch<T>(endpoint: string, data: Record<string, unknown>): Promise<T> {
+    const config: AxiosRequestConfig = {
+      headers: this.getHeaders(),
+      withCredentials: false,
+    };
+
+    try {
+      const response: AxiosResponse<T> = await axios.patch<T>(
+        `${this.getBaseUrl()}${endpoint}`,
+        data,
+        config
+      );
+      return response.data;
+    } catch (error) {
+      this.handleAuthError(error);
+      console.error(`Error patching ${endpoint}:`, error);
+      throw error;
+    }
+  }
+
+  async delete<T>(endpoint: string): Promise<T> {
+    const config: AxiosRequestConfig = {
+      headers: this.getHeaders(),
+      withCredentials: false,
+    };
+
+    try {
+      const response: AxiosResponse<T> = await axios.delete<T>(
+        `${this.getBaseUrl()}${endpoint}`,
+        config
+      );
+      return response.data;
+    } catch (error) {
+      this.handleAuthError(error);
+      console.error(`Error deleting from ${endpoint}:`, error);
+      throw error;
+    }
+  }
+}
+
+export const apiClient = new ApiClient();
+
+export class ApiError extends Error {
+  status: number;
+  data?: unknown;
+
+  constructor(message: string, status: number, data?: unknown) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.data = data;
+  }
+}
