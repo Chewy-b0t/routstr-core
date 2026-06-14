@@ -43,5 +43,5 @@ jobs:
             GIT_COMMIT=${{ steps.gitmeta.outputs.sha }}
             GIT_TAG=${{ steps.gitmeta.outputs.tag }}
           tags: |
-            ghcr.io/routstr/proxy:latest
-            ghcr.io/routstr/core:latest
+            ghcr.io/${{ github.repository_owner }}/routstr-core:latest
+            ghcr.io/${{ github.repository_owner }}/routstr-core:${{ steps.gitmeta.outputs.sha }}
